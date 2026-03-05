@@ -1,0 +1,10 @@
+# requirements.txt
+torch>=2.0.0
+torchvision
+numpy
+pandas
+scikit-learn
+timm         
+transformers 
+matplotlib
+tqdm

@@ -1,0 +1,38 @@
+%%{init: {'theme': 'base', 'themeVariables': {
+  'background': '#ffffff',
+  'primaryColor': '#f8fafc',
+  'primaryTextColor': '#0f172a',
+  'primaryBorderColor': '#334155',
+  'lineColor': '#475569',
+  'secondaryColor': '#eff6ff',
+  'tertiaryColor': '#f0fdf4',
+  'fontFamily': 'Times New Roman'
+}}}%%
+flowchart LR
+    classDef core fill:#eff6ff,stroke:#1d4ed8,stroke-width:1.6px,color:#0f172a;
+    classDef module fill:#f8fafc,stroke:#334155,stroke-width:1.2px,color:#0f172a;
+    classDef decision fill:#fff7ed,stroke:#c2410c,stroke-width:1.4px,color:#7c2d12;
+    classDef metric fill:#f0fdf4,stroke:#15803d,stroke-width:1.4px,color:#14532d;
+    classDef note fill:#fef2f2,stroke:#b91c1c,stroke-width:1px,color:#7f1d1d;
+
+    S["Continual Stream D1 to Dt<br>Task t introduces novel classes Ct"]:::core
+    A["A. Frozen Perception Backbone<br>Pretrained ViT, feature h = f(x)<br>Backbone parameters fixed"]:::module
+    B{"B. Open-World Novelty Detector<br>Mahalanobis or Energy score<br>Dynamic threshold tau"}:::decision
+    C["C. PEFT CIL Updater<br>Adapters inserted in ViT blocks<br>Train adapters and head only"]:::module
+    D["D. Episodic Memory and Distillation<br>Replay buffer with herding (K per class)<br>Ltotal = LCE + lambda LKD"]:::module
+    H["Classifier Head<br>Prediction on seen classes"]:::module
+    E["Task-wise Evaluation"]:::module
+    M["Metrics and Baselines<br>AA, AF, Naive FT, iCaRL"]:::metric
+
+    N1["Constraint: No full historical data access"]:::note
+    N2["Constraint: Memory-limited local replay"]:::note
+    N3["Constraint: On-device efficiency budget"]:::note
+
+    S --> A --> B
+    B -- Known --> H --> E --> M
+    B -- OOD / Novel --> C --> D --> H
+
+    N1 -.-> D
+    N2 -.-> D
+    N3 -.-> A
+    N3 -.-> C

@@ -1,0 +1,31 @@
+flowchart LR
+    %% Styling
+    classDef core fill:#E8F1FF,stroke:#1D4ED8,stroke-width:2px,color:#0F172A;
+    classDef module fill:#F8FAFC,stroke:#334155,stroke-width:1.8px,color:#0F172A;
+    classDef decision fill:#FFF7ED,stroke:#C2410C,stroke-width:2px,color:#7C2D12;
+    classDef metric fill:#ECFDF5,stroke:#15803D,stroke-width:2px,color:#14532D;
+    classDef constraint fill:#FEF2F2,stroke:#B91C1C,stroke-width:1.8px,color:#7F1D1D;
+
+    S["Continuous Stream D1 to Dt<br>Stage t introduces novel classes Ct"]:::core
+
+    A["Module A Frozen ViT Backbone<br>Feature extractor h from x<br>Backbone frozen"]:::module
+    B{"Module B Novelty Detector<br>Mahalanobis or Energy score<br>Dynamic threshold tau"}:::decision
+    H["Classifier Head<br>Predict over seen classes"]:::module
+    C["Module C PEFT CIL Updater<br>Train Adapter and Classifier only"]:::module
+    D["Module D Memory and Distillation<br>Replay buffer with herding<br>Total loss CE plus lambda KD"]:::module
+
+    E["Task wise Evaluation"]:::module
+    M["Metrics AA and AF<br>Baselines Naive FT and iCaRL"]:::metric
+
+    X1["No full historical data access"]:::constraint
+    X2["Memory limited local replay only"]:::constraint
+    X3["On device edge efficiency constraints"]:::constraint
+
+    S --> A --> B
+    B -- Known --> H --> E --> M
+    B -- OOD / Novel --> C --> D --> H
+
+    X1 -. constrains .-> D
+    X2 -. constrains .-> D
+    X3 -. constrains .-> A
+    X3 -. constrains .-> C

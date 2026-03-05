@@ -1,0 +1,875 @@
+"""
+CIL Trainer: Core training loop with KD, Energy OOD, MoE, and Orthogonal Projection.
+
+Implements the ERO-MoE-CIL pipeline from blueprint:
+    1. Train on new classes + exemplar replay
+    2. Loss = CE + λ * KD + MoE balance loss
+    3. Orthogonal gradient projection (optional)
+    4. Energy-based OOD evaluation (optional)
+    5. Herding exemplar selection after each task
+    6. Evaluate and record AA / AF / OOD metrics
+"""
+
+from dataclasses import asdict
+from pathlib import Path
+import random
+import time
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from config import Config
+from models import CILModel
+from utils.data_utils import (
+    ClassSubset,
+    get_task_dataloaders,
+    TRAIN_TRANSFORM,
+    TEST_TRANSFORM,
+)
+from utils.energy_ood import (
+    collect_energy_scores,
+    calibrate_threshold,
+    evaluate_ood,
+)
+from utils.herding import extract_class_features, herding_select
+from utils.metrics import print_metrics
+from utils.orthogonal_projection import OrthogonalProjector
+
+
+class CILTrainer:
+    """
+    Orchestrates the full ERO-MoE-CIL pipeline.
+
+    Supports ablation toggles via Config flags:
+        - use_moe:        MoE adapters vs single adapter
+        - use_energy_ood: Energy-based OOD detection
+        - use_ortho_proj: Orthogonal gradient projection
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+
+        # Will be initialized in run()
+        self.model: Optional[CILModel] = None
+        self.old_model: Optional[CILModel] = None
+
+        # Exemplar memory: class_id → List[(image_tensor, label)]
+        self.exemplar_sets: dict = {}
+
+        # Accuracy matrix for metrics: acc_matrix[t][i] = acc on task i after task t
+        self.acc_matrix: Optional[np.ndarray] = None
+
+        # All classes seen so far
+        self.seen_classes: List[int] = []
+
+        # Label mapping: original CIFAR-100 class ID → contiguous index
+        self.label_map: dict = {}
+
+        # Orthogonal projector (Module D extension)
+        self.projector: Optional[OrthogonalProjector] = None
+        if cfg.use_ortho_proj:
+            self.projector = OrthogonalProjector(max_rank=cfg.ortho_max_rank)
+
+        # OOD metrics log: list of dicts per task
+        self.ood_metrics_log: List[Dict[str, float]] = []
+        # Energy threshold per task
+        self.energy_thresholds: List[float] = []
+
+        # Runtime metrics (saved after training for plotting)
+        self.task_old_task_accuracy: List[float] = []
+        self.task_max_memory_mb: List[float] = []
+        self.task_avg_epoch_time_sec: List[float] = []
+        self.task_avg_batch_latency_ms: List[float] = []
+        self.epoch_records: List[Dict[str, float]] = []
+
+        # Best checkpoint tracking (by stage-wise AA)
+        self.best_aa: float = float("-inf")
+        self.best_task_id: int = -1
+
+    # ── Training Loop for One Task ─────────────────────────────────────────
+
+    def _train_one_task(
+        self,
+        train_loader: DataLoader,
+        task_id: int,
+        num_old_classes: int,
+    ) -> Dict[str, List[float]]:
+        """Train the model for one incremental task and return runtime stats."""
+        self.model.train()
+
+        # Snapshot params for orthogonal projection
+        if self.projector is not None and task_id > 0:
+            self.projector.snapshot_params(self.model)
+
+        # Optimizer: only adapter/MoE + classifier params
+        trainable_params = self.model.get_trainable_params()
+        optimizer = AdamW(trainable_params, lr=self.cfg.lr_adapter,
+                          weight_decay=self.cfg.weight_decay)
+
+        # Scheduler: warmup + cosine annealing
+        warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0,
+                          total_iters=self.cfg.warmup_epochs)
+        cosine = CosineAnnealingLR(optimizer,
+                                   T_max=self.cfg.epochs - self.cfg.warmup_epochs)
+        scheduler = SequentialLR(optimizer, [warmup, cosine],
+                                 milestones=[self.cfg.warmup_epochs])
+
+        ce_criterion = nn.CrossEntropyLoss()
+        epoch_time_sec: List[float] = []
+        epoch_avg_batch_latency_ms: List[float] = []
+        epoch_peak_memory_mb: List[float] = []
+        num_batches = max(1, len(train_loader))
+
+        for epoch in range(self.cfg.epochs):
+            total_loss = 0.0
+            correct = 0
+            total = 0
+            epoch_start = time.perf_counter()
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
+
+            pbar = tqdm(train_loader, desc=f"Task {task_id} Epoch {epoch+1}/{self.cfg.epochs}")
+            for images, labels in pbar:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+
+                logits = self.model(images)
+
+                # ── Cross-Entropy Loss ──
+                loss_ce = ce_criterion(logits, labels)
+
+                # ── Knowledge Distillation Loss (Module D) ──
+                loss_kd = torch.tensor(0.0, device=self.device)
+                if self.old_model is not None and num_old_classes > 0:
+                    with torch.no_grad():
+                        old_logits = self.old_model(images)[:, :num_old_classes]
+                    new_logits = logits[:, :num_old_classes]
+                    T = self.cfg.kd_temperature
+                    loss_kd = F.kl_div(
+                        F.log_softmax(new_logits / T, dim=1),
+                        F.softmax(old_logits / T, dim=1),
+                        reduction="batchmean",
+                    ) * (T * T)
+
+                # ── MoE Balance Loss (Module C) ──
+                loss_balance = torch.tensor(0.0, device=self.device)
+                if self.cfg.use_moe:
+                    loss_balance = self.model.get_moe_balance_loss().to(self.device)
+
+                # ── Total Loss ──
+                loss = loss_ce + self.cfg.kd_lambda * loss_kd + loss_balance
+
+                optimizer.zero_grad()
+                loss.backward()
+
+                # ── Orthogonal Projection (Module D extension) ──
+                if self.projector is not None and self.projector.has_basis():
+                    self.projector.project_gradients(self.model)
+
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(trainable_params,
+                                               self.cfg.grad_clip_norm)
+                optimizer.step()
+
+                total_loss += loss.item() * images.size(0)
+                _, predicted = logits.max(1)
+                correct += predicted.eq(labels).sum().item()
+                total += labels.size(0)
+
+                pbar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    acc=f"{100.*correct/total:.1f}%",
+                )
+
+            scheduler.step()
+            epoch_duration = time.perf_counter() - epoch_start
+            avg_batch_latency_ms = (epoch_duration / num_batches) * 1000.0
+            if self.device.type == "cuda":
+                peak_mem_mb = torch.cuda.max_memory_allocated(self.device) / (1024.0 ** 2)
+            else:
+                peak_mem_mb = 0.0
+
+            epoch_time_sec.append(epoch_duration)
+            epoch_avg_batch_latency_ms.append(avg_batch_latency_ms)
+            epoch_peak_memory_mb.append(peak_mem_mb)
+            self.epoch_records.append({
+                "task_id": float(task_id),
+                "epoch": float(epoch + 1),
+                "epoch_time_sec": float(epoch_duration),
+                "avg_batch_latency_ms": float(avg_batch_latency_ms),
+                "peak_memory_mb": float(peak_mem_mb),
+            })
+
+            epoch_loss = total_loss / total
+            epoch_acc = 100.0 * correct / total
+            print(
+                f"  Epoch {epoch+1}: loss={epoch_loss:.4f}, acc={epoch_acc:.1f}%, "
+                f"time={epoch_duration:.2f}s, latency={avg_batch_latency_ms:.2f}ms/batch, "
+                f"peak_mem={peak_mem_mb:.1f}MB"
+            )
+
+        # Update orthogonal basis after training
+        if self.projector is not None and task_id > 0:
+            self.projector.update_bases(self.model)
+            stats = self.projector.get_stats()
+            total_rank = sum(stats.values())
+            print(f"  Orthogonal projection: {len(stats)} params, total rank={total_rank}")
+
+        return {
+            "epoch_time_sec": epoch_time_sec,
+            "epoch_avg_batch_latency_ms": epoch_avg_batch_latency_ms,
+            "epoch_peak_memory_mb": epoch_peak_memory_mb,
+        }
+
+    # ── Evaluation ─────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _evaluate_task(
+        self,
+        test_dataset,
+        class_ids: List[int],
+    ) -> float:
+        """Evaluate accuracy on a specific set of classes."""
+        self.model.eval()
+        test_subset = ClassSubset(test_dataset, class_ids, transform=TEST_TRANSFORM,
+                                  label_map=self.label_map)
+        loader = DataLoader(test_subset, batch_size=self.cfg.batch_size,
+                            shuffle=False, num_workers=self.cfg.num_workers,
+                            pin_memory=True)
+        correct = 0
+        total = 0
+        for images, labels in loader:
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+            logits = self.model(images)
+            _, predicted = logits.max(1)
+            correct += predicted.eq(labels).sum().item()
+            total += labels.size(0)
+
+        return correct / total if total > 0 else 0.0
+
+    # ── Energy OOD Evaluation (Module B) ──────────────────────────────────
+
+    def _evaluate_ood(
+        self,
+        test_dataset,
+        seen_class_ids: List[int],
+        unseen_class_ids: List[int],
+        task_id: int,
+    ) -> Dict[str, float]:
+        """
+        Evaluate OOD detection using energy scores.
+
+        Uses seen classes as ID and unseen classes as OOD.
+        """
+        self.model.eval()
+
+        # Build ID loader (seen classes)
+        id_subset = ClassSubset(test_dataset, seen_class_ids,
+                                transform=TEST_TRANSFORM, label_map=self.label_map)
+        id_loader = DataLoader(id_subset, batch_size=self.cfg.batch_size,
+                               shuffle=False, num_workers=self.cfg.num_workers,
+                               pin_memory=True)
+
+        # Build OOD loader (unseen classes)
+        ood_subset = ClassSubset(test_dataset, unseen_class_ids,
+                                 transform=TEST_TRANSFORM, label_map=None)
+        ood_loader = DataLoader(ood_subset, batch_size=self.cfg.batch_size,
+                                shuffle=False, num_workers=self.cfg.num_workers,
+                                pin_memory=True)
+
+        # Collect energy scores
+        id_scores = collect_energy_scores(
+            self.model, id_loader,
+            temperature=self.cfg.energy_temperature,
+            device=str(self.device),
+        )
+        ood_scores = collect_energy_scores(
+            self.model, ood_loader,
+            temperature=self.cfg.energy_temperature,
+            device=str(self.device),
+        )
+
+        # Calibrate threshold
+        tau = calibrate_threshold(id_scores, percentile=self.cfg.ood_percentile)
+        self.energy_thresholds.append(tau)
+
+        # Evaluate OOD detection
+        ood_results = evaluate_ood(id_scores, ood_scores)
+        ood_results["threshold"] = tau
+        ood_results["task_id"] = task_id
+        ood_results["id_mean_energy"] = float(np.mean(id_scores))
+        ood_results["ood_mean_energy"] = float(np.mean(ood_scores))
+
+        return ood_results
+
+    # ── Exemplar Management ────────────────────────────────────────────────
+
+    def _update_exemplars(
+        self,
+        train_dataset,
+        new_class_ids: List[int],
+    ) -> None:
+        """Select exemplars for new classes via herding."""
+        print("  Updating exemplar memory via herding...")
+        train_subset = ClassSubset(train_dataset, new_class_ids,
+                                   transform=TRAIN_TRANSFORM,
+                                   label_map=self.label_map)
+
+        for class_id in new_class_ids:
+            features, samples = extract_class_features(
+                self.model, train_subset, class_id,
+                device=str(self.device),
+                batch_size=self.cfg.batch_size,
+                label_map=self.label_map,
+            )
+            selected = herding_select(features, samples,
+                                      k=self.cfg.exemplars_per_class)
+            self.exemplar_sets[class_id] = selected
+            print(f"    Class {class_id}: {len(selected)} exemplars selected")
+
+    def _get_all_exemplars(self) -> List[Tuple]:
+        """Flatten all exemplar sets into a single list."""
+        all_exemplars = []
+        for class_id in sorted(self.exemplar_sets.keys()):
+            all_exemplars.extend(self.exemplar_sets[class_id])
+        return all_exemplars
+
+    def _save_runtime_metrics(self, output_dir: Path) -> Path:
+        """Persist runtime metrics used for post-training plotting."""
+        metrics_path = output_dir / "training_metrics.npz"
+
+        task_ids = np.arange(len(self.task_old_task_accuracy), dtype=int)
+        old_task_acc = np.array(self.task_old_task_accuracy, dtype=float)
+        max_memory_mb = np.array(self.task_max_memory_mb, dtype=float)
+        avg_epoch_time_sec = np.array(self.task_avg_epoch_time_sec, dtype=float)
+        avg_batch_latency_ms = np.array(self.task_avg_batch_latency_ms, dtype=float)
+
+        epoch_task_ids = np.array([int(r["task_id"]) for r in self.epoch_records], dtype=int)
+        epoch_indices = np.array([int(r["epoch"]) for r in self.epoch_records], dtype=int)
+        epoch_time_sec = np.array([r["epoch_time_sec"] for r in self.epoch_records], dtype=float)
+        epoch_latency_ms = np.array([r["avg_batch_latency_ms"] for r in self.epoch_records], dtype=float)
+        epoch_peak_memory_mb = np.array([r["peak_memory_mb"] for r in self.epoch_records], dtype=float)
+
+        save_dict = dict(
+            task_ids=task_ids,
+            task_old_task_accuracy=old_task_acc,
+            task_max_memory_mb=max_memory_mb,
+            task_avg_epoch_time_sec=avg_epoch_time_sec,
+            task_avg_batch_latency_ms=avg_batch_latency_ms,
+            epoch_task_ids=epoch_task_ids,
+            epoch_indices=epoch_indices,
+            epoch_time_sec=epoch_time_sec,
+            epoch_avg_batch_latency_ms=epoch_latency_ms,
+            epoch_peak_memory_mb=epoch_peak_memory_mb,
+        )
+
+        # Save OOD metrics if available
+        if self.ood_metrics_log:
+            ood_auroc = np.array([m.get("auroc", 0.0) for m in self.ood_metrics_log])
+            ood_fpr = np.array([m.get("fpr_at_95tpr", 1.0) for m in self.ood_metrics_log])
+            ood_task_ids = np.array([int(m.get("task_id", i)) for i, m in enumerate(self.ood_metrics_log)])
+            save_dict["ood_auroc"] = ood_auroc
+            save_dict["ood_fpr_at_95tpr"] = ood_fpr
+            save_dict["ood_task_ids"] = ood_task_ids
+
+        np.savez(metrics_path, **save_dict)
+
+        global_max_mem = float(np.max(max_memory_mb)) if max_memory_mb.size > 0 else 0.0
+        valid_old_acc = old_task_acc[np.isfinite(old_task_acc)]
+        final_old_acc = float(valid_old_acc[-1]) if valid_old_acc.size > 0 else float("nan")
+        overall_epoch_time = float(np.mean(avg_epoch_time_sec)) if avg_epoch_time_sec.size > 0 else 0.0
+        overall_latency = float(np.mean(avg_batch_latency_ms)) if avg_batch_latency_ms.size > 0 else 0.0
+
+        print("\nRuntime Metrics Summary")
+        print(f"  Max Memory Allocated: {global_max_mem:.1f} MB")
+        if np.isfinite(final_old_acc):
+            print(f"  Accuracy on Old Tasks (final): {final_old_acc * 100:.2f}%")
+        else:
+            print("  Accuracy on Old Tasks (final): N/A (only base task trained)")
+        print(f"  Avg Time per Epoch: {overall_epoch_time:.2f} s")
+        print(f"  Avg Latency: {overall_latency:.2f} ms/batch")
+
+        if self.ood_metrics_log:
+            last_ood = self.ood_metrics_log[-1]
+            print(f"  OOD AUROC (final): {last_ood.get('auroc', 0):.4f}")
+            print(f"  OOD FPR@95TPR (final): {last_ood.get('fpr_at_95tpr', 1):.4f}")
+
+        print(f"  Runtime metrics saved to {metrics_path}")
+
+        return metrics_path
+
+    # ── Checkpoint / Resume ────────────────────────────────────────────────
+
+    def _get_checkpoint_dir(self) -> Path:
+        if self.cfg.checkpoint_dir:
+            return Path(self.cfg.checkpoint_dir)
+        return Path(self.cfg.output_dir) / "checkpoints"
+
+    def resolve_resume_path(self, resume_path: str = "") -> Path:
+        """Resolve an explicit checkpoint path or pick the latest checkpoint."""
+        if resume_path:
+            candidate = Path(resume_path)
+            if candidate.exists():
+                return candidate
+            raise FileNotFoundError(f"Checkpoint file not found: {candidate}")
+
+        checkpoint_dir = self._get_checkpoint_dir()
+        latest = checkpoint_dir / "latest.pt"
+        if latest.exists():
+            return latest
+
+        task_checkpoints = sorted(checkpoint_dir.glob("task_*.pt"))
+        if task_checkpoints:
+            return task_checkpoints[-1]
+
+        raise FileNotFoundError(
+            f"No checkpoint found in {checkpoint_dir}. "
+            "Run training once or provide --resume_path."
+        )
+
+    def _serialize_exemplar_sets(self) -> Dict[int, List[Tuple[torch.Tensor, int]]]:
+        """Move exemplar tensors to CPU and ensure labels are plain ints."""
+        serialized = {}
+        for class_id, samples in self.exemplar_sets.items():
+            packed = []
+            for image, label in samples:
+                if torch.is_tensor(image):
+                    image_tensor = image.detach().cpu()
+                else:
+                    image_tensor = torch.as_tensor(image)
+                packed.append((image_tensor, int(label)))
+            serialized[int(class_id)] = packed
+        return serialized
+
+    def _deserialize_exemplar_sets(self, payload: Dict) -> Dict[int, List[Tuple[torch.Tensor, int]]]:
+        """Restore exemplar format to in-memory replay buffer structure."""
+        restored = {}
+        for class_id, samples in payload.items():
+            normalized = []
+            for image, label in samples:
+                if not torch.is_tensor(image):
+                    image = torch.as_tensor(image)
+                normalized.append((image.cpu(), int(label)))
+            restored[int(class_id)] = normalized
+        return restored
+
+    def _serialize_projector_bases(self) -> Dict[str, torch.Tensor]:
+        """Serialize orthogonal projector bases (if enabled)."""
+        if self.projector is None:
+            return {}
+        return {
+            name: basis.detach().cpu()
+            for name, basis in self.projector._bases.items()
+        }
+
+    def _infer_num_experts_from_state(self, model_state: Dict[str, torch.Tensor]) -> int:
+        """Infer MoE expert count from checkpoint state dict."""
+        for key, tensor in model_state.items():
+            if key.endswith("moe_adapter.router.gate.weight"):
+                return int(tensor.shape[0])
+        return int(self.cfg.num_experts)
+
+    def _save_checkpoint(
+        self,
+        task_id: int,
+        task_classes: List[List[int]],
+        checkpoint_name: Optional[str] = None,
+        update_latest: bool = True,
+        is_best: bool = False,
+    ) -> Path:
+        """Save a training checkpoint."""
+        if self.model is None:
+            raise RuntimeError("Cannot save checkpoint: model is not initialized.")
+        if self.acc_matrix is None:
+            raise RuntimeError("Cannot save checkpoint: acc_matrix is not initialized.")
+
+        checkpoint_dir = self._get_checkpoint_dir()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        model_state_cpu = {
+            key: value.detach().cpu()
+            for key, value in self.model.state_dict().items()
+        }
+
+        runtime_metrics = {
+            "task_old_task_accuracy": list(self.task_old_task_accuracy),
+            "task_max_memory_mb": list(self.task_max_memory_mb),
+            "task_avg_epoch_time_sec": list(self.task_avg_epoch_time_sec),
+            "task_avg_batch_latency_ms": list(self.task_avg_batch_latency_ms),
+            "epoch_records": list(self.epoch_records),
+        }
+
+        checkpoint = {
+            "version": 2,
+            "completed_task_id": int(task_id),
+            "model_state_dict": model_state_cpu,
+            "seen_classes": [int(cls_id) for cls_id in self.seen_classes],
+            "label_map": {int(k): int(v) for k, v in self.label_map.items()},
+            "exemplar_sets": self._serialize_exemplar_sets(),
+            "acc_matrix": self.acc_matrix.copy(),
+            "task_classes": [[int(cls_id) for cls_id in task] for task in task_classes],
+            "config": asdict(self.cfg),
+            "model_use_moe": bool(self.cfg.use_moe),
+            "model_num_experts": int(self._infer_num_experts_from_state(model_state_cpu)),
+            "model_top_k": int(self.cfg.top_k),
+            "projector_bases": self._serialize_projector_bases(),
+            "ood_metrics_log": list(self.ood_metrics_log),
+            "energy_thresholds": list(self.energy_thresholds),
+            "runtime_metrics": runtime_metrics,
+            "best_aa_so_far": float(self.best_aa),
+            "best_task_id": int(self.best_task_id),
+            "is_best": bool(is_best),
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.random.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            },
+        }
+
+        if checkpoint_name is None:
+            checkpoint_path = checkpoint_dir / f"task_{task_id:03d}.pt"
+        else:
+            checkpoint_path = checkpoint_dir / checkpoint_name
+
+        torch.save(checkpoint, checkpoint_path)
+        if update_latest:
+            torch.save(checkpoint, checkpoint_dir / "latest.pt")
+
+        print(f"  Checkpoint saved: {checkpoint_path}")
+        return checkpoint_path
+
+    def _load_checkpoint(self, checkpoint_path: Path, task_classes: List[List[int]]) -> int:
+        """Load checkpoint and return the next task index to run."""
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+        completed_task_id = int(checkpoint.get("completed_task_id", -1))
+        total_tasks = len(task_classes)
+        if completed_task_id < -1 or completed_task_id >= total_tasks:
+            raise ValueError(
+                f"Invalid completed_task_id={completed_task_id} for total_tasks={total_tasks}"
+            )
+
+        saved_task_classes = checkpoint.get("task_classes")
+        current_task_classes = [[int(c) for c in task] for task in task_classes]
+        if saved_task_classes is not None:
+            normalized_saved = [[int(c) for c in task] for task in saved_task_classes]
+            if normalized_saved != current_task_classes:
+                raise ValueError(
+                    "Checkpoint task schedule does not match current run config. "
+                    "Use matching seed/init/inc class settings."
+                )
+
+        saved_use_moe = bool(checkpoint.get("model_use_moe", self.cfg.use_moe))
+        if saved_use_moe != bool(self.cfg.use_moe):
+            raise ValueError(
+                "Checkpoint use_moe flag does not match current run. "
+                f"(ckpt={saved_use_moe}, current={self.cfg.use_moe})"
+            )
+
+        saved_cfg = checkpoint.get("config", {})
+        saved_use_ortho = bool(saved_cfg.get("use_ortho_proj", self.cfg.use_ortho_proj))
+        if saved_use_ortho != bool(self.cfg.use_ortho_proj):
+            raise ValueError(
+                "Checkpoint use_ortho_proj flag does not match current run. "
+                f"(ckpt={saved_use_ortho}, current={self.cfg.use_ortho_proj})"
+            )
+
+        model_state = checkpoint.get("model_state_dict")
+        if model_state is None:
+            raise ValueError("Checkpoint missing model_state_dict.")
+        if "classifier.fc.weight" not in model_state:
+            raise ValueError("Checkpoint is incompatible: missing classifier.fc.weight.")
+
+        num_model_classes = int(model_state["classifier.fc.weight"].shape[0])
+        num_experts = int(
+            checkpoint.get("model_num_experts", self._infer_num_experts_from_state(model_state))
+        )
+        top_k = int(checkpoint.get("model_top_k", self.cfg.top_k))
+
+        self.model = CILModel(
+            backbone_name=self.cfg.backbone,
+            pretrained=False,
+            feature_dim=self.cfg.feature_dim,
+            adapter_bottleneck=self.cfg.adapter_bottleneck,
+            init_classes=num_model_classes,
+            use_moe=saved_use_moe,
+            num_experts=num_experts,
+            top_k=top_k,
+        ).to(self.device)
+        self.model.load_state_dict(model_state, strict=True)
+        self.old_model = None
+
+        self.seen_classes = [int(cls_id) for cls_id in checkpoint.get("seen_classes", [])]
+        self.label_map = {int(k): int(v) for k, v in checkpoint.get("label_map", {}).items()}
+        self.exemplar_sets = self._deserialize_exemplar_sets(checkpoint.get("exemplar_sets", {}))
+
+        self.acc_matrix = np.zeros((total_tasks, total_tasks))
+        saved_matrix = checkpoint.get("acc_matrix")
+        if saved_matrix is not None:
+            saved_matrix = np.asarray(saved_matrix, dtype=float)
+            rows = min(saved_matrix.shape[0], total_tasks)
+            cols = min(saved_matrix.shape[1], total_tasks)
+            self.acc_matrix[:rows, :cols] = saved_matrix[:rows, :cols]
+
+        self.ood_metrics_log = list(checkpoint.get("ood_metrics_log", []))
+        self.energy_thresholds = list(checkpoint.get("energy_thresholds", []))
+
+        runtime_metrics = checkpoint.get("runtime_metrics", {})
+        self.task_old_task_accuracy = list(runtime_metrics.get("task_old_task_accuracy", []))
+        self.task_max_memory_mb = list(runtime_metrics.get("task_max_memory_mb", []))
+        self.task_avg_epoch_time_sec = list(runtime_metrics.get("task_avg_epoch_time_sec", []))
+        self.task_avg_batch_latency_ms = list(runtime_metrics.get("task_avg_batch_latency_ms", []))
+        self.epoch_records = list(runtime_metrics.get("epoch_records", []))
+
+        if "best_aa_so_far" in checkpoint and "best_task_id" in checkpoint:
+            self.best_aa = float(checkpoint["best_aa_so_far"])
+            self.best_task_id = int(checkpoint["best_task_id"])
+        else:
+            self.best_aa = float("-inf")
+            self.best_task_id = -1
+            for t in range(completed_task_id + 1):
+                aa_t = float(np.mean(self.acc_matrix[t, :t + 1]))
+                if aa_t > self.best_aa:
+                    self.best_aa = aa_t
+                    self.best_task_id = t
+
+        if self.projector is not None:
+            projector_bases = checkpoint.get("projector_bases", {})
+            self.projector._bases = {
+                name: basis.cpu() for name, basis in projector_bases.items()
+            }
+        elif checkpoint.get("projector_bases"):
+            raise ValueError(
+                "Checkpoint contains orthogonal projector bases but current run has "
+                "use_ortho_proj=False."
+            )
+
+        rng_state = checkpoint.get("rng_state")
+        if rng_state is not None:
+            random.setstate(rng_state["python"])
+            np.random.set_state(rng_state["numpy"])
+            torch.random.set_rng_state(rng_state["torch"])
+            if torch.cuda.is_available() and rng_state.get("cuda") is not None:
+                torch.cuda.set_rng_state_all(rng_state["cuda"])
+
+        next_task_id = completed_task_id + 1
+        print(
+            f"Loaded checkpoint: completed task {completed_task_id}, "
+            f"next task {next_task_id}, best AA {self.best_aa:.4f} (task {self.best_task_id})"
+        )
+        return next_task_id
+
+    # ── Main Pipeline ──────────────────────────────────────────────────────
+
+    def run(
+        self,
+        task_classes: List[List[int]],
+        train_dataset,
+        test_dataset,
+        resume_checkpoint: Optional[Path] = None,
+    ) -> np.ndarray:
+        """
+        Run the full CIL pipeline across all tasks.
+
+        Args:
+            task_classes: List of class ID lists, one per incremental task.
+            train_dataset: Raw CIFAR-100 train dataset.
+            test_dataset:  Raw CIFAR-100 test dataset.
+
+        Returns:
+            acc_matrix: (T, T) accuracy matrix.
+        """
+        T = len(task_classes)
+        if resume_checkpoint is not None:
+            start_task_id = self._load_checkpoint(Path(resume_checkpoint), task_classes)
+        else:
+            start_task_id = 0
+            self.model = None
+            self.old_model = None
+            self.exemplar_sets = {}
+            self.seen_classes = []
+            self.label_map = {}
+            self.acc_matrix = np.zeros((T, T))
+            self.task_old_task_accuracy = []
+            self.task_max_memory_mb = []
+            self.task_avg_epoch_time_sec = []
+            self.task_avg_batch_latency_ms = []
+            self.epoch_records = []
+            self.ood_metrics_log = []
+            self.energy_thresholds = []
+            self.best_aa = float("-inf")
+            self.best_task_id = -1
+            if self.projector is not None:
+                self.projector._bases = {}
+
+        if start_task_id >= T:
+            print("Checkpoint already contains all tasks. Skipping training loop.")
+
+        # Flatten all class IDs for OOD evaluation
+        all_class_ids = []
+        for classes in task_classes:
+            all_class_ids.extend(classes)
+
+        # Print enabled modules
+        modules = ["Adapter+KD (baseline)"]
+        if self.cfg.use_moe:
+            modules.append(f"MoE ({self.cfg.num_experts} experts, top-{self.cfg.top_k})")
+        if self.cfg.use_energy_ood:
+            modules.append("Energy OOD")
+        if self.cfg.use_ortho_proj:
+            modules.append(f"Orthogonal Projection (rank≤{self.cfg.ortho_max_rank})")
+        print(f"Enabled modules: {' + '.join(modules)}")
+
+        for task_id in range(start_task_id, T):
+            new_classes = task_classes[task_id]
+            print(f"\n{'='*60}")
+            print(f"Task {task_id}: Learning classes {new_classes}")
+            print(f"{'='*60}")
+
+            num_old_classes = len(self.seen_classes)
+
+            # ── Build label map: original class ID → contiguous index ──
+            for cls_id in new_classes:
+                if cls_id not in self.label_map:
+                    self.label_map[cls_id] = len(self.label_map)
+
+            # ── Step 1: Initialize or expand model ──
+            if self.model is None and len(self.seen_classes) == 0:
+                self.model = CILModel(
+                    backbone_name=self.cfg.backbone,
+                    pretrained=self.cfg.pretrained,
+                    feature_dim=self.cfg.feature_dim,
+                    adapter_bottleneck=self.cfg.adapter_bottleneck,
+                    init_classes=len(new_classes),
+                    use_moe=self.cfg.use_moe,
+                    num_experts=self.cfg.num_experts,
+                    top_k=self.cfg.top_k,
+                ).to(self.device)
+
+                # Print model info
+                total_params = sum(p.numel() for p in self.model.parameters())
+                trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                print(f"  Total params: {total_params:,} | Trainable: {trainable:,} ({100*trainable/total_params:.1f}%)")
+            else:
+                if self.model is None:
+                    raise RuntimeError("Model state is missing before incremental expansion.")
+                # Save old model for KD
+                self.old_model = self.model.freeze_copy()
+                # Expand classifier for new classes
+                self.model.expand_classes(len(new_classes))
+                # Add new MoE experts for the new task
+                if self.cfg.use_moe and self.cfg.add_expert_per_task:
+                    self.model.add_moe_experts(num_new=1)
+                    print(f"  Added 1 new expert per MoE layer")
+
+            # ── Step 2: Build training data (new classes + exemplars) ──
+            exemplars = self._get_all_exemplars() if task_id > 0 else None
+            train_loader, _ = get_task_dataloaders(
+                train_dataset, test_dataset, new_classes,
+                batch_size=self.cfg.batch_size,
+                num_workers=self.cfg.num_workers,
+                exemplar_data=exemplars,
+                label_map=self.label_map,
+            )
+
+            # ── Step 3: Train ──
+            train_stats = self._train_one_task(train_loader, task_id, num_old_classes)
+            peak_mem = max(train_stats["epoch_peak_memory_mb"]) if train_stats["epoch_peak_memory_mb"] else 0.0
+            avg_epoch_time = (
+                float(np.mean(train_stats["epoch_time_sec"]))
+                if train_stats["epoch_time_sec"] else 0.0
+            )
+            avg_latency = (
+                float(np.mean(train_stats["epoch_avg_batch_latency_ms"]))
+                if train_stats["epoch_avg_batch_latency_ms"] else 0.0
+            )
+            self.task_max_memory_mb.append(float(peak_mem))
+            self.task_avg_epoch_time_sec.append(avg_epoch_time)
+            self.task_avg_batch_latency_ms.append(avg_latency)
+
+            # ── Step 4: Update seen classes ──
+            self.seen_classes.extend(new_classes)
+
+            # ── Step 5: Update exemplars ──
+            self._update_exemplars(train_dataset, new_classes)
+
+            # ── Step 6: Evaluate on all seen tasks ──
+            print("  Evaluating on all seen tasks...")
+            for past_id in range(task_id + 1):
+                acc = self._evaluate_task(test_dataset, task_classes[past_id])
+                self.acc_matrix[task_id][past_id] = acc
+                print(f"    Task {past_id} accuracy: {acc:.4f}")
+
+            if task_id == 0:
+                old_task_acc = float("nan")
+            else:
+                old_task_acc = float(np.mean(self.acc_matrix[task_id][:task_id]))
+            self.task_old_task_accuracy.append(old_task_acc)
+            if np.isfinite(old_task_acc):
+                print(f"  Old-task accuracy (mean): {old_task_acc * 100:.2f}%")
+            else:
+                print("  Old-task accuracy (mean): N/A (base task)")
+
+            # ── Step 7: Energy OOD evaluation (Module B) ──
+            if self.cfg.use_energy_ood and task_id < T - 1:
+                unseen_ids = []
+                for future_task in task_classes[task_id + 1:]:
+                    unseen_ids.extend(future_task)
+                if unseen_ids:
+                    print("  Evaluating OOD detection (Energy)...")
+                    ood_results = self._evaluate_ood(
+                        test_dataset,
+                        seen_class_ids=list(self.seen_classes),
+                        unseen_class_ids=unseen_ids,
+                        task_id=task_id,
+                    )
+                    self.ood_metrics_log.append(ood_results)
+                    print(f"    AUROC: {ood_results['auroc']:.4f} | "
+                          f"FPR@95TPR: {ood_results['fpr_at_95tpr']:.4f} | "
+                          f"Threshold: {ood_results['threshold']:.4f}")
+                    print(f"    ID energy (mean): {ood_results['id_mean_energy']:.4f} | "
+                          f"OOD energy (mean): {ood_results['ood_mean_energy']:.4f}")
+
+            # ── Step 8: Print metrics ──
+            print_metrics(self.acc_matrix, task_id)
+
+            current_aa = float(np.mean(self.acc_matrix[task_id, :task_id + 1]))
+            is_new_best = current_aa > self.best_aa
+            if is_new_best:
+                self.best_aa = current_aa
+                self.best_task_id = task_id
+                print(f"  New best AA: {self.best_aa:.4f} at task {task_id}")
+
+            if self.cfg.auto_checkpoint:
+                self._save_checkpoint(task_id, task_classes)
+            if self.cfg.save_best and is_new_best:
+                self._save_checkpoint(
+                    task_id,
+                    task_classes,
+                    checkpoint_name="best.pt",
+                    update_latest=False,
+                    is_best=True,
+                )
+
+        # ── Save final metrics ──
+        output_dir = Path(self.cfg.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        np.save(output_dir / "acc_matrix.npy", self.acc_matrix)
+        self._save_runtime_metrics(output_dir)
+        print(f"\nAccuracy matrix saved to {output_dir / 'acc_matrix.npy'}")
+
+        return self.acc_matrix
