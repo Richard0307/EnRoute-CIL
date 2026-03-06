@@ -54,8 +54,6 @@ Personalized-Cockpit-CIL/
 ├── scripts/
 │   ├── plot_results.py          # Figure generation for single run / aggregate run
 │   └── run_multiseed.py         # Multi-seed experiment runner and README updater
-├── blueprint.md                 # Research/system blueprint
-├── methodology_vit.md           # ViT-specific design notes
 ├── docs/rp_framework_paper.png  # Main framework figure used in README
 
 ```
