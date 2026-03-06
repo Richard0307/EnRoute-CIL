@@ -72,6 +72,11 @@ class IncrementalClassifier(nn.Module):
         # Copy old weights
         new.weight.data[:old.out_features] = old.weight.data
         new.bias.data[:old.out_features] = old.bias.data
+        # Initialize new class weights to match the scale of old weights
+        # so that initial logits for new classes are not wildly different.
+        old_std = old.weight.data.std().item()
+        nn.init.normal_(new.weight.data[old.out_features:], mean=0.0, std=old_std)
+        nn.init.zeros_(new.bias.data[old.out_features:])
         self.fc = new
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

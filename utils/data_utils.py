@@ -105,11 +105,14 @@ def get_task_dataloaders(
     num_workers: int = 4,
     exemplar_data: List[Tuple] = None,
     label_map: Dict[int, int] = None,
+    oversample_exemplars: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build train/test DataLoaders for a specific incremental task.
 
     If exemplar_data is provided, it is mixed into the training set.
+    Exemplars are stored as raw PIL images and TRAIN_TRANSFORM is applied
+    on-the-fly so that data augmentation is re-applied each epoch.
     """
     train_subset = ClassSubset(train_dataset, class_ids,
                                transform=TRAIN_TRANSFORM, label_map=label_map)
@@ -118,7 +121,11 @@ def get_task_dataloaders(
 
     # Mix exemplars into training data
     if exemplar_data:
-        train_subset = MixedDataset(train_subset, exemplar_data)
+        train_subset = MixedDataset(
+            train_subset, exemplar_data,
+            exemplar_transform=TRAIN_TRANSFORM,
+            oversample_exemplars=oversample_exemplars,
+        )
 
     train_loader = DataLoader(train_subset, batch_size=batch_size,
                               shuffle=True, num_workers=num_workers,
@@ -130,12 +137,30 @@ def get_task_dataloaders(
 
 
 class MixedDataset(Dataset):
-    """Combines a ClassSubset with exemplar replay data."""
+    """Combines a ClassSubset with exemplar replay data.
+
+    Exemplars are stored as raw PIL images and transformed on-the-fly so that
+    data augmentation (e.g. RandomHorizontalFlip) is re-applied each epoch,
+    matching the augmentation behaviour of new-task data.
+
+    When ``oversample_exemplars`` is True the exemplar list is repeated so that
+    old-class samples appear roughly as often as new-class samples, mitigating
+    the class-imbalance problem in incremental learning.
+    """
 
     def __init__(self, new_data: ClassSubset,
-                 exemplar_data: List[Tuple]):
+                 exemplar_data: List[Tuple],
+                 exemplar_transform=None,
+                 oversample_exemplars: bool = False):
         self.new_data = new_data
-        self.exemplar_data = exemplar_data
+        self.exemplar_transform = exemplar_transform
+
+        if oversample_exemplars and len(exemplar_data) > 0:
+            # Repeat exemplars so total ≈ len(new_data)
+            repeats = max(1, len(new_data) // len(exemplar_data))
+            self.exemplar_data = exemplar_data * repeats
+        else:
+            self.exemplar_data = exemplar_data
 
     def __len__(self) -> int:
         return len(self.new_data) + len(self.exemplar_data)
@@ -144,4 +169,7 @@ class MixedDataset(Dataset):
         if idx < len(self.new_data):
             return self.new_data[idx]
         else:
-            return self.exemplar_data[idx - len(self.new_data)]
+            img, label = self.exemplar_data[idx - len(self.new_data)]
+            if self.exemplar_transform is not None:
+                img = self.exemplar_transform(img)
+            return img, label

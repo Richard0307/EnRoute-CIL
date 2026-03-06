@@ -26,7 +26,9 @@ def extract_class_features(
 
     Returns:
         features: (N, d) numpy array of feature vectors.
-        samples:  List of (image_tensor, remapped_label) tuples for replay.
+        samples:  List of (raw_PIL_image, remapped_label) tuples for replay.
+                  Raw images are stored so that data augmentation can be
+                  re-applied each epoch during training.
     """
     model.eval()
     # Collect indices for this class
@@ -34,10 +36,11 @@ def extract_class_features(
     class_indices = np.where(targets == class_id)[0]
 
     features_list = []
-    samples = []
+    samples = []       # (raw_PIL, label) for storage
+    transformed = []   # transformed tensors for feature extraction
 
     for idx in class_indices:
-        img, label = dataset.dataset[idx]
+        img, label = dataset.dataset[idx]  # img is raw PIL
         if dataset.transform is not None:
             img_t = dataset.transform(img)
         else:
@@ -45,10 +48,11 @@ def extract_class_features(
         # Remap label to contiguous index
         if label_map is not None:
             label = label_map[label]
-        samples.append((img_t, label))
+        samples.append((img, label))       # store RAW PIL image
+        transformed.append(img_t)
 
     # Batch feature extraction
-    all_imgs = torch.stack([s[0] for s in samples]).to(device)
+    all_imgs = torch.stack(transformed).to(device)
     for i in range(0, len(all_imgs), batch_size):
         batch = all_imgs[i:i + batch_size]
         feats = model.extract_features(batch)

@@ -73,6 +73,14 @@ def parse_args() -> Config:
                         help="Enable orthogonal gradient projection (Module D ext)")
     parser.add_argument("--ortho_max_rank", type=int, default=cfg.ortho_max_rank)
 
+    # DER++ & WA
+    parser.add_argument("--der_alpha", type=float, default=cfg.der_alpha,
+                        help="DER++ MSE loss coefficient (0 to disable)")
+    parser.add_argument("--no_wa", action="store_true",
+                        help="Disable Weight Aligning")
+    parser.add_argument("--no_oversample", action="store_true",
+                        help="Disable exemplar oversampling")
+
     # System
     parser.add_argument("--device", type=str, default=cfg.device)
     parser.add_argument("--seed", type=int, default=cfg.seed)
@@ -90,6 +98,8 @@ def parse_args() -> Config:
     args = parser.parse_args()
     args_dict = vars(args)
     disable_auto_checkpoint = args_dict.pop("no_auto_checkpoint")
+    no_wa = args_dict.pop("no_wa")
+    no_oversample = args_dict.pop("no_oversample")
 
     # Update config with parsed arguments
     for key, value in args_dict.items():
@@ -100,6 +110,10 @@ def parse_args() -> Config:
     if args.no_add_expert:
         cfg.add_expert_per_task = False
     cfg.auto_checkpoint = not disable_auto_checkpoint
+    if no_wa:
+        cfg.use_wa = False
+    if no_oversample:
+        cfg.oversample_exemplars = False
 
     return cfg
 

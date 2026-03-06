@@ -7,11 +7,14 @@ representations.
 
 Reference: OPLoRA / Orthogonal Projection for Continual Learning.
 
-Core formula:
+Core formula (fixed-shape parameters):
     ∇W_proj = (I - U_old @ U_old^T) @ ∇W_new
 
-Where U_old contains the principal directions of old-task weight updates,
-obtained via SVD of accumulated weight changes.
+Block projection for dynamically expanded parameters (e.g. MoE router):
+    P = diag(I - U_old @ U_old^T, I)
+
+    Old rows are projected to preserve old-task directions;
+    new rows (from expert expansion) pass through freely.
 """
 
 from typing import Dict, List
@@ -95,6 +98,19 @@ class OrthogonalProjector:
             # Merge with existing basis
             if name in self._bases:
                 old_basis = self._bases[name]
+                n_old = old_basis.shape[0]
+                n_new = new_dirs.shape[0]
+
+                if n_old != n_new:
+                    # Parameter row dimension expanded (e.g. MoE router gate).
+                    # Pad old basis with zero rows so old subspace is preserved
+                    # in the original row positions; new rows have no history.
+                    padded = torch.zeros(n_new, old_basis.shape[1],
+                                         dtype=old_basis.dtype,
+                                         device=old_basis.device)
+                    padded[:n_old] = old_basis
+                    old_basis = padded
+
                 combined = torch.cat([old_basis, new_dirs], dim=1)
                 # Re-orthogonalize and trim to max_rank
                 try:
@@ -135,9 +151,28 @@ class OrthogonalProjector:
             else:
                 grad_2d = grad.reshape(original_shape[0], -1)
 
-            # Project: g_proj = g - U @ U^T @ g
-            projection = U_old @ (U_old.t() @ grad_2d.t())  # (out, batch)
-            grad_projected = grad_2d - projection.t()
+            if U_old.dim() != 2:
+                continue
+
+            n_basis = U_old.shape[0]
+            n_grad = grad_2d.shape[0]
+
+            if n_basis == n_grad:
+                # Standard case: dimensions match, full projection.
+                projection = U_old @ (U_old.t() @ grad_2d)
+                grad_projected = grad_2d - projection
+            elif n_basis < n_grad:
+                # Block projection P = diag(I - U_old @ U_old^T, I)
+                # Old rows: project to null space of historical subspace.
+                # New rows: identity (free learning for expanded params).
+                grad_projected = grad_2d.clone()
+                old_part = grad_2d[:n_basis]
+                projection = U_old @ (U_old.t() @ old_part)
+                grad_projected[:n_basis] = old_part - projection
+                # grad_projected[n_basis:] unchanged — identity block
+            else:
+                # Basis has more rows than gradient (unexpected shrink); skip.
+                continue
 
             param.grad.data = grad_projected.reshape(original_shape)
 

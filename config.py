@@ -25,6 +25,7 @@ class Config:
 
     # ── Memory ──
     exemplars_per_class: int = 20   # K in herding selection
+    oversample_exemplars: bool = True  # Oversample exemplars to balance with new-class data
 
     # ── Training ──
     epochs: int = 20
@@ -53,6 +54,12 @@ class Config:
     # ── Orthogonal Projection (Module D extension) ──
     use_ortho_proj: bool = False    # Enable orthogonal gradient projection
     ortho_max_rank: int = 20        # Max rank of historical subspace per param
+
+    # ── DER++ (Dark Experience Replay++) ──
+    der_alpha: float = 0.1          # MSE loss coefficient for stored-logit replay
+
+    # ── Weight Aligning (WA) ──
+    use_wa: bool = True             # Align old/new classifier weight norms after each task
 
     # ── Device ──
     device: str = "cuda"

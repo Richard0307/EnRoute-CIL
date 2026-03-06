@@ -25,6 +25,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from torch.utils.tensorboard import SummaryWriter
+
 from config import Config
 from models import CILModel
 from utils.data_utils import (
@@ -64,6 +66,8 @@ class CILTrainer:
 
         # Exemplar memory: class_id → List[(image_tensor, label)]
         self.exemplar_sets: dict = {}
+        # DER++ logit memory: class_id → List[logit_tensor]  (parallel to exemplar_sets)
+        self.exemplar_logits: dict = {}
 
         # Accuracy matrix for metrics: acc_matrix[t][i] = acc on task i after task t
         self.acc_matrix: Optional[np.ndarray] = None
@@ -94,6 +98,19 @@ class CILTrainer:
         # Best checkpoint tracking (by stage-wise AA)
         self.best_aa: float = float("-inf")
         self.best_task_id: int = -1
+
+        # TensorBoard writer
+        tb_dir = Path(cfg.output_dir) / "tensorboard"
+        tb_dir.mkdir(parents=True, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=str(tb_dir))
+        print(f"TensorBoard log dir: {tb_dir}")
+
+        # Global step counter for per-epoch logging
+        self._global_step: int = 0
+        # Global step counter for per-batch logging
+        self._global_batch_step: int = 0
+        # Write TensorBoard batch scalars every N batches
+        self._tb_batch_log_interval: int = 10
 
     # ── Training Loop for One Task ─────────────────────────────────────────
 
@@ -129,6 +146,12 @@ class CILTrainer:
         epoch_peak_memory_mb: List[float] = []
         num_batches = max(1, len(train_loader))
 
+        # DER++: build separate replay loader with stored logits
+        der_loader = None
+        der_iter = None
+        if self.cfg.der_alpha > 0 and task_id > 0:
+            der_loader = self._build_der_replay_loader()
+
         for epoch in range(self.cfg.epochs):
             total_loss = 0.0
             correct = 0
@@ -137,8 +160,12 @@ class CILTrainer:
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
 
+            # Reset DER++ iterator each epoch
+            if der_loader is not None:
+                der_iter = iter(der_loader)
+
             pbar = tqdm(train_loader, desc=f"Task {task_id} Epoch {epoch+1}/{self.cfg.epochs}")
-            for images, labels in pbar:
+            for batch_idx, (images, labels) in enumerate(pbar, start=1):
                 images = images.to(self.device)
                 labels = labels.to(self.device)
 
@@ -165,8 +192,24 @@ class CILTrainer:
                 if self.cfg.use_moe:
                     loss_balance = self.model.get_moe_balance_loss().to(self.device)
 
+                # ── DER++ Replay Loss ──
+                loss_der = torch.tensor(0.0, device=self.device)
+                if der_iter is not None:
+                    try:
+                        der_imgs, _der_lbls, der_stored = next(der_iter)
+                    except StopIteration:
+                        der_iter = iter(der_loader)
+                        der_imgs, _der_lbls, der_stored = next(der_iter)
+                    der_imgs = der_imgs.to(self.device)
+                    der_stored = der_stored.to(self.device)
+                    der_current = self.model(der_imgs)
+                    # MSE on overlapping logit dimensions (stored may have fewer classes)
+                    n_stored = der_stored.shape[1]
+                    loss_der = F.mse_loss(der_current[:, :n_stored], der_stored)
+
                 # ── Total Loss ──
-                loss = loss_ce + self.cfg.kd_lambda * loss_kd + loss_balance
+                loss = (loss_ce + self.cfg.kd_lambda * loss_kd
+                        + loss_balance + self.cfg.der_alpha * loss_der)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -190,6 +233,23 @@ class CILTrainer:
                     acc=f"{100.*correct/total:.1f}%",
                 )
 
+                # ── TensorBoard: per-batch scalars (for live monitoring) ──
+                self._global_batch_step += 1
+                if (
+                    batch_idx % self._tb_batch_log_interval == 0
+                    or batch_idx == num_batches
+                ):
+                    running_loss = total_loss / max(total, 1)
+                    running_acc = 100.0 * correct / max(total, 1)
+                    self.writer.add_scalar("Batch/Training_Loss", loss.item(), self._global_batch_step)
+                    self.writer.add_scalar("Batch/Running_Loss", running_loss, self._global_batch_step)
+                    self.writer.add_scalar("Batch/Running_Accuracy", running_acc, self._global_batch_step)
+                    self.writer.add_scalar("Batch/Learning_Rate", optimizer.param_groups[0]["lr"], self._global_batch_step)
+                    if self.device.type == "cuda":
+                        current_mem_mb = torch.cuda.memory_allocated(self.device) / (1024.0 ** 2)
+                        self.writer.add_scalar("Batch/Current_GPU_Memory_MB", current_mem_mb, self._global_batch_step)
+                    self.writer.flush()
+
             scheduler.step()
             epoch_duration = time.perf_counter() - epoch_start
             avg_batch_latency_ms = (epoch_duration / num_batches) * 1000.0
@@ -211,6 +271,22 @@ class CILTrainer:
 
             epoch_loss = total_loss / total
             epoch_acc = 100.0 * correct / total
+
+            # ── TensorBoard: per-epoch scalars ──
+            self._global_step += 1
+            self.writer.add_scalar("Epoch/Training_Loss", epoch_loss, self._global_step)
+            self.writer.add_scalar("Epoch/Training_Accuracy", epoch_acc, self._global_step)
+            self.writer.add_scalar("Epoch/Learning_Rate", optimizer.param_groups[0]["lr"], self._global_step)
+            self.writer.add_scalar("Epoch/Peak_GPU_Memory_MB", peak_mem_mb, self._global_step)
+            if self.device.type == "cuda":
+                try:
+                    gpu_util = torch.cuda.utilization(self.device)
+                    self.writer.add_scalar("Epoch/GPU_Utilization_Pct", gpu_util, self._global_step)
+                except Exception:
+                    pass
+            self.writer.add_scalar("Epoch/Wall_Clock_Time_s", epoch_duration, self._global_step)
+            self.writer.flush()
+
             print(
                 f"  Epoch {epoch+1}: loss={epoch_loss:.4f}, acc={epoch_acc:.1f}%, "
                 f"time={epoch_duration:.2f}s, latency={avg_batch_latency_ms:.2f}ms/batch, "
@@ -229,6 +305,35 @@ class CILTrainer:
             "epoch_avg_batch_latency_ms": epoch_avg_batch_latency_ms,
             "epoch_peak_memory_mb": epoch_peak_memory_mb,
         }
+
+    # ── Weight Aligning (WA) ─────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _wa_compute_gamma(self, num_old_classes: int) -> float:
+        """Compute WA scaling factor γ = mean_norm_new / mean_norm_old."""
+        fc = self.model.classifier.fc
+        norm_per_class = fc.weight.data.norm(dim=1)
+        old_mean = norm_per_class[:num_old_classes].mean().item()
+        new_mean = norm_per_class[num_old_classes:].mean().item()
+        if old_mean < 1e-8:
+            return 1.0
+        gamma = new_mean / old_mean
+        print(f"  WA: γ={gamma:.4f} (old_norm={old_mean:.4f}, new_norm={new_mean:.4f})")
+        return gamma
+
+    @torch.no_grad()
+    def _wa_apply(self, num_old_classes: int, gamma: float) -> None:
+        """Temporarily scale old-class classifier weights by γ."""
+        fc = self.model.classifier.fc
+        fc.weight.data[:num_old_classes] *= gamma
+        fc.bias.data[:num_old_classes] *= gamma
+
+    @torch.no_grad()
+    def _wa_revert(self, num_old_classes: int, gamma: float) -> None:
+        """Revert WA scaling to restore original training weights."""
+        fc = self.model.classifier.fc
+        fc.weight.data[:num_old_classes] /= gamma
+        fc.bias.data[:num_old_classes] /= gamma
 
     # ── Evaluation ─────────────────────────────────────────────────────────
 
@@ -319,7 +424,7 @@ class CILTrainer:
         train_dataset,
         new_class_ids: List[int],
     ) -> None:
-        """Select exemplars for new classes via herding."""
+        """Select exemplars for new classes via herding, and store DER++ logits."""
         print("  Updating exemplar memory via herding...")
         train_subset = ClassSubset(train_dataset, new_class_ids,
                                    transform=TRAIN_TRANSFORM,
@@ -336,6 +441,50 @@ class CILTrainer:
                                       k=self.cfg.exemplars_per_class)
             self.exemplar_sets[class_id] = selected
             print(f"    Class {class_id}: {len(selected)} exemplars selected")
+
+        # DER++: store current model's logits for all exemplars
+        if self.cfg.der_alpha > 0:
+            self._store_exemplar_logits()
+
+    @torch.no_grad()
+    def _store_exemplar_logits(self) -> None:
+        """Run current model on all exemplars and cache logit vectors (DER++).
+
+        Uses TEST_TRANSFORM (deterministic) so stored logits are consistent.
+        """
+        self.model.eval()
+        self.exemplar_logits = {}
+        for class_id, samples in self.exemplar_sets.items():
+            images = torch.stack([TEST_TRANSFORM(img) for img, _ in samples]).to(self.device)
+            logits_list = []
+            for i in range(0, len(images), self.cfg.batch_size):
+                batch = images[i:i + self.cfg.batch_size]
+                logits_list.append(self.model(batch).cpu())
+            self.exemplar_logits[class_id] = torch.cat(logits_list, dim=0)
+        self.model.train()
+
+    def _build_der_replay_loader(self) -> Optional[DataLoader]:
+        """Build a DataLoader of (image, label, stored_logits) for DER++ replay.
+
+        Images are pre-transformed with TEST_TRANSFORM (deterministic) so they
+        match the conditions under which stored logits were computed.
+        """
+        if not self.exemplar_logits:
+            return None
+        images, labels, logits = [], [], []
+        for class_id in sorted(self.exemplar_sets.keys()):
+            stored_logits = self.exemplar_logits[class_id]
+            for idx, (img, lbl) in enumerate(self.exemplar_sets[class_id]):
+                images.append(TEST_TRANSFORM(img))
+                labels.append(lbl)
+                logits.append(stored_logits[idx])
+        dataset = torch.utils.data.TensorDataset(
+            torch.stack(images),
+            torch.tensor(labels, dtype=torch.long),
+            torch.stack(logits),
+        )
+        return DataLoader(dataset, batch_size=self.cfg.batch_size,
+                          shuffle=True, drop_last=False)
 
     def _get_all_exemplars(self) -> List[Tuple]:
         """Flatten all exemplar sets into a single list."""
@@ -438,7 +587,8 @@ class CILTrainer:
         )
 
     def _serialize_exemplar_sets(self) -> Dict[int, List[Tuple[torch.Tensor, int]]]:
-        """Move exemplar tensors to CPU and ensure labels are plain ints."""
+        """Convert exemplar PIL images to tensors for checkpoint storage."""
+        from torchvision.transforms.functional import to_tensor
         serialized = {}
         for class_id, samples in self.exemplar_sets.items():
             packed = []
@@ -446,20 +596,24 @@ class CILTrainer:
                 if torch.is_tensor(image):
                     image_tensor = image.detach().cpu()
                 else:
-                    image_tensor = torch.as_tensor(image)
+                    # PIL image → raw tensor (no normalization, just pixel values)
+                    image_tensor = to_tensor(image).cpu()
                 packed.append((image_tensor, int(label)))
             serialized[int(class_id)] = packed
         return serialized
 
-    def _deserialize_exemplar_sets(self, payload: Dict) -> Dict[int, List[Tuple[torch.Tensor, int]]]:
-        """Restore exemplar format to in-memory replay buffer structure."""
+    def _deserialize_exemplar_sets(self, payload: Dict) -> Dict[int, List[Tuple]]:
+        """Restore exemplar tensors back to PIL images for on-the-fly augmentation."""
+        from torchvision.transforms.functional import to_pil_image
         restored = {}
         for class_id, samples in payload.items():
             normalized = []
             for image, label in samples:
                 if not torch.is_tensor(image):
                     image = torch.as_tensor(image)
-                normalized.append((image.cpu(), int(label)))
+                # Convert tensor back to PIL for on-the-fly augmentation
+                pil_image = to_pil_image(image.cpu())
+                normalized.append((pil_image, int(label)))
             restored[int(class_id)] = normalized
         return restored
 
@@ -523,6 +677,10 @@ class CILTrainer:
             "model_num_experts": int(self._infer_num_experts_from_state(model_state_cpu)),
             "model_top_k": int(self.cfg.top_k),
             "projector_bases": self._serialize_projector_bases(),
+            "exemplar_logits": {
+                int(k): v.detach().cpu()
+                for k, v in self.exemplar_logits.items()
+            },
             "ood_metrics_log": list(self.ood_metrics_log),
             "energy_thresholds": list(self.energy_thresholds),
             "runtime_metrics": runtime_metrics,
@@ -617,6 +775,13 @@ class CILTrainer:
         self.label_map = {int(k): int(v) for k, v in checkpoint.get("label_map", {}).items()}
         self.exemplar_sets = self._deserialize_exemplar_sets(checkpoint.get("exemplar_sets", {}))
 
+        # Restore DER++ logits
+        saved_logits = checkpoint.get("exemplar_logits", {})
+        self.exemplar_logits = {
+            int(k): v.cpu() if torch.is_tensor(v) else torch.as_tensor(v)
+            for k, v in saved_logits.items()
+        }
+
         self.acc_matrix = np.zeros((total_tasks, total_tasks))
         saved_matrix = checkpoint.get("acc_matrix")
         if saved_matrix is not None:
@@ -634,6 +799,7 @@ class CILTrainer:
         self.task_avg_epoch_time_sec = list(runtime_metrics.get("task_avg_epoch_time_sec", []))
         self.task_avg_batch_latency_ms = list(runtime_metrics.get("task_avg_batch_latency_ms", []))
         self.epoch_records = list(runtime_metrics.get("epoch_records", []))
+        self._global_step = len(self.epoch_records)
 
         if "best_aa_so_far" in checkpoint and "best_task_id" in checkpoint:
             self.best_aa = float(checkpoint["best_aa_so_far"])
@@ -701,6 +867,7 @@ class CILTrainer:
             self.model = None
             self.old_model = None
             self.exemplar_sets = {}
+            self.exemplar_logits = {}
             self.seen_classes = []
             self.label_map = {}
             self.acc_matrix = np.zeros((T, T))
@@ -732,6 +899,10 @@ class CILTrainer:
             modules.append("Energy OOD")
         if self.cfg.use_ortho_proj:
             modules.append(f"Orthogonal Projection (rank≤{self.cfg.ortho_max_rank})")
+        if self.cfg.der_alpha > 0:
+            modules.append(f"DER++ (α={self.cfg.der_alpha})")
+        if self.cfg.use_wa:
+            modules.append("Weight Aligning")
         print(f"Enabled modules: {' + '.join(modules)}")
 
         for task_id in range(start_task_id, T):
@@ -784,6 +955,7 @@ class CILTrainer:
                 num_workers=self.cfg.num_workers,
                 exemplar_data=exemplars,
                 label_map=self.label_map,
+                oversample_exemplars=self.cfg.oversample_exemplars,
             )
 
             # ── Step 3: Train ──
@@ -801,13 +973,21 @@ class CILTrainer:
             self.task_avg_epoch_time_sec.append(avg_epoch_time)
             self.task_avg_batch_latency_ms.append(avg_latency)
 
+            # ── Step 3.5: Compute WA γ (evaluate-only, not applied to weights yet) ──
+            wa_gamma = 1.0
+            if self.cfg.use_wa and num_old_classes > 0:
+                wa_gamma = self._wa_compute_gamma(num_old_classes)
+
             # ── Step 4: Update seen classes ──
             self.seen_classes.extend(new_classes)
 
-            # ── Step 5: Update exemplars ──
+            # ── Step 5: Update exemplars (on ORIGINAL weights, before WA) ──
             self._update_exemplars(train_dataset, new_classes)
 
-            # ── Step 6: Evaluate on all seen tasks ──
+            # ── Step 6: Evaluate with WA applied temporarily ──
+            if wa_gamma != 1.0:
+                self._wa_apply(num_old_classes, wa_gamma)
+
             print("  Evaluating on all seen tasks...")
             for past_id in range(task_id + 1):
                 acc = self._evaluate_task(test_dataset, task_classes[past_id])
@@ -838,16 +1018,37 @@ class CILTrainer:
                         task_id=task_id,
                     )
                     self.ood_metrics_log.append(ood_results)
+                    self.writer.add_scalar("OOD/AUROC", ood_results["auroc"], task_id)
+                    self.writer.add_scalar("OOD/FPR_at_95TPR", ood_results["fpr_at_95tpr"], task_id)
                     print(f"    AUROC: {ood_results['auroc']:.4f} | "
                           f"FPR@95TPR: {ood_results['fpr_at_95tpr']:.4f} | "
                           f"Threshold: {ood_results['threshold']:.4f}")
                     print(f"    ID energy (mean): {ood_results['id_mean_energy']:.4f} | "
                           f"OOD energy (mean): {ood_results['ood_mean_energy']:.4f}")
 
-            # ── Step 8: Print metrics ──
+            # ── Step 8: Print metrics & TensorBoard per-task logging ──
             print_metrics(self.acc_matrix, task_id)
 
             current_aa = float(np.mean(self.acc_matrix[task_id, :task_id + 1]))
+            # Per-task TensorBoard logging
+            for past_id in range(task_id + 1):
+                self.writer.add_scalar(
+                    f"Per_Task_Accuracy/Task_{past_id}",
+                    self.acc_matrix[task_id][past_id],
+                    task_id,
+                )
+            self.writer.add_scalar("CIL/Average_Accuracy", current_aa, task_id)
+            if task_id > 0:
+                forgetting_vals = [
+                    max(self.acc_matrix[:task_id+1, j]) - self.acc_matrix[task_id, j]
+                    for j in range(task_id)
+                ]
+                af = float(np.mean(forgetting_vals))
+                self.writer.add_scalar("CIL/Average_Forgetting", af, task_id)
+            self.writer.add_scalar("Resource/Peak_GPU_Memory_MB", peak_mem, task_id)
+            self.writer.add_scalar("Resource/Task_Wall_Clock_Time_s",
+                                   sum(train_stats["epoch_time_sec"]), task_id)
+            self.writer.flush()
             is_new_best = current_aa > self.best_aa
             if is_new_best:
                 self.best_aa = current_aa
@@ -865,11 +1066,18 @@ class CILTrainer:
                     is_best=True,
                 )
 
+            # ── Revert WA so next task trains on original weights ──
+            if wa_gamma != 1.0:
+                self._wa_revert(num_old_classes, wa_gamma)
+
         # ── Save final metrics ──
         output_dir = Path(self.cfg.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         np.save(output_dir / "acc_matrix.npy", self.acc_matrix)
         self._save_runtime_metrics(output_dir)
         print(f"\nAccuracy matrix saved to {output_dir / 'acc_matrix.npy'}")
+
+        # Close TensorBoard writer
+        self.writer.close()
 
         return self.acc_matrix
