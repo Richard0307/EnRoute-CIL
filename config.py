@@ -8,11 +8,13 @@ class Config:
     # Dataset
     dataset: str = "cifar100"
     data_root: str = "./data/raw"
+    class_order_path: str = ""
     num_workers: int = 4
 
     # Incremental schedule
     init_classes: int = 50
     inc_classes: int = 10
+    max_tasks: int = -1
 
     # Model
     backbone: str = "vit_base_patch16_224"
@@ -48,6 +50,12 @@ class Config:
     use_energy_ood: bool = False
     energy_temperature: float = 1.0
     ood_percentile: float = 95.0
+    use_ood_expert_routing: bool = False
+    ood_router_lambda: float = 0.2
+    ood_router_temperature: float = 1.0
+    ood_trigger_min_count: int = 20
+    ood_trigger_min_ratio: float = 0.05
+    ood_cache_max_per_task: int = 128
 
     # Orthogonal projection
     use_ortho_proj: bool = False
@@ -66,6 +74,7 @@ class Config:
     # Logging
     output_dir: str = "./output"
     seed: int = 42
+    auto_plots: bool = True
 
     # Checkpoint / Resume
     checkpoint_dir: str = ""

@@ -292,6 +292,70 @@ def plot_ood_metrics(runtime_metrics: dict[str, np.ndarray], output_dir: Path) -
     return path
 
 
+def plot_ood_threshold_stability(runtime_metrics: dict[str, np.ndarray], output_dir: Path) -> Path:
+    """Plot dynamic OOD threshold against ID/OOD energy means."""
+    task_ids = runtime_metrics["ood_task_ids"]
+    threshold = runtime_metrics["ood_threshold"]
+    id_mean = runtime_metrics["ood_id_mean_energy"]
+    ood_mean = runtime_metrics["ood_ood_mean_energy"]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(task_ids, threshold, marker="o", linewidth=2.5, color="#6A1B9A", label="Dynamic threshold")
+    ax.plot(task_ids, id_mean, marker="s", linewidth=2.0, color="#00897B", label="ID mean energy")
+    ax.plot(task_ids, ood_mean, marker="^", linewidth=2.0, color="#EF6C00", label="OOD mean energy")
+    ax.set_xlabel("After Training Task")
+    ax.set_ylabel("Energy")
+    ax.set_title("Dynamic OOD Threshold Stability")
+    ax.set_xticks(task_ids)
+    ax.set_xticklabels([f"Task {i}" for i in task_ids])
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=10)
+
+    path = output_dir / "ood_threshold_stability.png"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def plot_ood_trigger_dynamics(runtime_metrics: dict[str, np.ndarray], output_dir: Path) -> Path:
+    """Plot offline OOD trigger ratio and expert activation events."""
+    task_ids = runtime_metrics["ood_trigger_task_ids"]
+    flagged_ratio = runtime_metrics["ood_trigger_flagged_ratio"] * 100.0
+    activated = runtime_metrics["ood_trigger_active"]
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+
+    color_ratio = "#3949AB"
+    color_active = "#C62828"
+
+    ax1.plot(task_ids, flagged_ratio, marker="o", linewidth=2.5,
+             color=color_ratio, label="Flagged ratio (%)")
+    ax1.set_xlabel("Current Task")
+    ax1.set_ylabel("Flagged ratio (%)", color=color_ratio)
+    ax1.tick_params(axis="y", labelcolor=color_ratio)
+    ax1.set_xticks(task_ids)
+    ax1.set_xticklabels([f"Task {i}" for i in task_ids])
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+    ax2.step(task_ids, activated, where="mid", linewidth=2.0,
+             color=color_active, label="Expert activated")
+    ax2.set_ylabel("Activation", color=color_active)
+    ax2.tick_params(axis="y", labelcolor=color_active)
+    ax2.set_ylim([-0.1, 1.1])
+    ax2.set_yticks([0, 1])
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=10)
+    ax1.set_title("Offline OOD Trigger Dynamics")
+
+    path = output_dir / "ood_trigger_dynamics.png"
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
 def _compute_final_aa_af(acc_matrix: np.ndarray) -> tuple[float, float]:
     """Compute final AA/AF in percentage for reporting."""
     T = acc_matrix.shape[0]
@@ -346,6 +410,10 @@ def generate_all_plots(
         # OOD metrics plots (Module B)
         if "ood_auroc" in runtime_metrics:
             plot_paths["ood_metrics"] = plot_ood_metrics(runtime_metrics, output_dir)
+        if "ood_threshold" in runtime_metrics:
+            plot_paths["ood_threshold_stability"] = plot_ood_threshold_stability(runtime_metrics, output_dir)
+        if "ood_trigger_task_ids" in runtime_metrics:
+            plot_paths["ood_trigger_dynamics"] = plot_ood_trigger_dynamics(runtime_metrics, output_dir)
     elif verbose:
         print(f"Runtime metrics not found at {runtime_metrics_path}; skipped runtime plots.")
 

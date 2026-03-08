@@ -1,6 +1,7 @@
 """CIL Trainer: core training loop for ERO-MoE-CIL pipeline."""
 
 from dataclasses import asdict
+import json
 from pathlib import Path
 import random
 import time
@@ -12,10 +13,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
+from torchvision.transforms.functional import to_pil_image, to_tensor
 
 from config import Config
 from models import CILModel
@@ -26,6 +28,7 @@ from utils.data_utils import (
     TEST_TRANSFORM,
 )
 from utils.energy_ood import (
+    compute_energy_scores,
     collect_energy_scores,
     calibrate_threshold,
     evaluate_ood,
@@ -57,6 +60,9 @@ class CILTrainer:
 
         self.ood_metrics_log: List[Dict[str, float]] = []
         self.energy_thresholds: List[float] = []
+        self.ood_trigger_log: List[Dict[str, float]] = []
+        self.offline_ood_cache: Dict[int, List[Dict[str, object]]] = {}
+        self.model_stats: Dict[str, float] = {}
 
         self.task_old_task_accuracy: List[float] = []
         self.task_max_memory_mb: List[float] = []
@@ -81,6 +87,7 @@ class CILTrainer:
         train_loader: DataLoader,
         task_id: int,
         num_old_classes: int,
+        trigger_state: Optional[Dict[str, float]] = None,
     ) -> Dict[str, List[float]]:
         """Train the model for one incremental task."""
         self.model.train()
@@ -104,6 +111,14 @@ class CILTrainer:
         epoch_avg_batch_latency_ms: List[float] = []
         epoch_peak_memory_mb: List[float] = []
         num_batches = max(1, len(train_loader))
+        trigger_active = bool(
+            trigger_state
+            and trigger_state.get("active", False)
+            and self.cfg.use_ood_expert_routing
+            and self.cfg.use_moe
+            and self.old_model is not None
+        )
+        trigger_tau = float(trigger_state.get("threshold", 0.0)) if trigger_state else 0.0
 
         der_loader = None
         der_iter = None
@@ -114,6 +129,8 @@ class CILTrainer:
             total_loss = 0.0
             correct = 0
             total = 0
+            epoch_router_loss: List[float] = []
+            epoch_trigger_strength: List[float] = []
             epoch_start = time.perf_counter()
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
@@ -131,9 +148,11 @@ class CILTrainer:
                 loss_ce = ce_criterion(logits, labels)
 
                 loss_kd = torch.tensor(0.0, device=self.device)
+                old_logits_full = None
                 if self.old_model is not None and num_old_classes > 0:
                     with torch.no_grad():
-                        old_logits = self.old_model(images)[:, :num_old_classes]
+                        old_logits_full = self.old_model(images)
+                        old_logits = old_logits_full[:, :num_old_classes]
                     new_logits = logits[:, :num_old_classes]
                     T = self.cfg.kd_temperature
                     loss_kd = F.kl_div(
@@ -145,6 +164,22 @@ class CILTrainer:
                 loss_balance = torch.tensor(0.0, device=self.device)
                 if self.cfg.use_moe:
                     loss_balance = self.model.get_moe_balance_loss().to(self.device)
+
+                loss_route = torch.tensor(0.0, device=self.device)
+                if trigger_active:
+                    if old_logits_full is None:
+                        with torch.no_grad():
+                            old_logits_full = self.old_model(images)
+                    trigger_strength = torch.sigmoid(
+                        (compute_energy_scores(
+                            old_logits_full,
+                            temperature=self.cfg.energy_temperature,
+                        ) - trigger_tau)
+                        / max(self.cfg.ood_router_temperature, 1e-6)
+                    )
+                    loss_route = self.model.get_moe_trigger_alignment_loss(trigger_strength)
+                    epoch_router_loss.append(float(loss_route.item()))
+                    epoch_trigger_strength.append(float(trigger_strength.mean().item()))
 
                 loss_der = torch.tensor(0.0, device=self.device)
                 if der_iter is not None:
@@ -160,7 +195,8 @@ class CILTrainer:
                     loss_der = F.mse_loss(der_current[:, :n_stored], der_stored)
 
                 loss = (loss_ce + self.cfg.kd_lambda * loss_kd
-                        + loss_balance + self.cfg.der_alpha * loss_der)
+                        + loss_balance + self.cfg.der_alpha * loss_der
+                        + self.cfg.ood_router_lambda * loss_route)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -193,6 +229,17 @@ class CILTrainer:
                     self.writer.add_scalar("Batch/Running_Loss", running_loss, self._global_batch_step)
                     self.writer.add_scalar("Batch/Running_Accuracy", running_acc, self._global_batch_step)
                     self.writer.add_scalar("Batch/Learning_Rate", optimizer.param_groups[0]["lr"], self._global_batch_step)
+                    if trigger_active and epoch_router_loss:
+                        self.writer.add_scalar(
+                            "Batch/OOD_Router_Loss",
+                            epoch_router_loss[-1],
+                            self._global_batch_step,
+                        )
+                        self.writer.add_scalar(
+                            "Batch/OOD_Trigger_Strength",
+                            epoch_trigger_strength[-1],
+                            self._global_batch_step,
+                        )
                     if self.device.type == "cuda":
                         current_mem_mb = torch.cuda.memory_allocated(self.device) / (1024.0 ** 2)
                         self.writer.add_scalar("Batch/Current_GPU_Memory_MB", current_mem_mb, self._global_batch_step)
@@ -225,6 +272,17 @@ class CILTrainer:
             self.writer.add_scalar("Epoch/Training_Accuracy", epoch_acc, self._global_step)
             self.writer.add_scalar("Epoch/Learning_Rate", optimizer.param_groups[0]["lr"], self._global_step)
             self.writer.add_scalar("Epoch/Peak_GPU_Memory_MB", peak_mem_mb, self._global_step)
+            if trigger_active and epoch_router_loss:
+                self.writer.add_scalar(
+                    "Epoch/OOD_Router_Loss",
+                    float(np.mean(epoch_router_loss)),
+                    self._global_step,
+                )
+                self.writer.add_scalar(
+                    "Epoch/OOD_Trigger_Strength",
+                    float(np.mean(epoch_trigger_strength)),
+                    self._global_step,
+                )
             if self.device.type == "cuda":
                 try:
                     gpu_util = torch.cuda.utilization(self.device)
@@ -345,6 +403,140 @@ class CILTrainer:
 
         return ood_results
 
+    @torch.no_grad()
+    def _calibrate_id_threshold_from_seen_data(self, train_dataset) -> float:
+        if self.old_model is None or len(self.seen_classes) == 0:
+            raise ValueError("Cannot calibrate OOD threshold without an old model and seen classes.")
+
+        seen_subset = ClassSubset(
+            train_dataset,
+            self.seen_classes,
+            transform=TEST_TRANSFORM,
+            label_map=None,
+        )
+        if len(seen_subset) == 0:
+            raise ValueError("Seen-class subset is empty; cannot calibrate OOD threshold.")
+
+        max_samples = min(len(seen_subset), 1024)
+        if len(seen_subset) > max_samples:
+            sampled_indices = np.random.choice(len(seen_subset), size=max_samples, replace=False).tolist()
+            seen_subset = Subset(seen_subset, sampled_indices)
+
+        loader = DataLoader(
+            seen_subset,
+            batch_size=self.cfg.batch_size,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+        )
+        id_scores = collect_energy_scores(
+            self.old_model,
+            loader,
+            temperature=self.cfg.energy_temperature,
+            device=str(self.device),
+        )
+        return calibrate_threshold(id_scores, percentile=self.cfg.ood_percentile)
+
+    @torch.no_grad()
+    def _collect_offline_ood_cache(
+        self,
+        train_dataset,
+        new_class_ids: List[int],
+        task_id: int,
+    ) -> Dict[str, float]:
+        if self.old_model is None:
+            return {"enabled": False, "active": False}
+
+        if self.energy_thresholds:
+            threshold = float(self.energy_thresholds[-1])
+        else:
+            threshold = self._calibrate_id_threshold_from_seen_data(train_dataset)
+
+        new_subset = ClassSubset(
+            train_dataset,
+            new_class_ids,
+            transform=None,
+            label_map=None,
+        )
+
+        flagged_samples: List[Dict[str, object]] = []
+        raw_images: List[object] = []
+        raw_labels: List[int] = []
+        transformed: List[torch.Tensor] = []
+
+        def flush_batch() -> None:
+            if not transformed:
+                return
+            batch = torch.stack(transformed).to(self.device)
+            logits = self.old_model(batch)
+            energies = compute_energy_scores(
+                logits,
+                temperature=self.cfg.energy_temperature,
+            ).cpu().numpy()
+            for image, label, energy in zip(raw_images, raw_labels, energies):
+                if energy <= threshold:
+                    continue
+                strength = float(
+                    torch.sigmoid(
+                        torch.tensor(
+                            (float(energy) - threshold)
+                            / max(self.cfg.ood_router_temperature, 1e-6)
+                        )
+                    ).item()
+                )
+                flagged_samples.append({
+                    "image": image,
+                    "label": int(label),
+                    "energy": float(energy),
+                    "trigger_strength": strength,
+                })
+            raw_images.clear()
+            raw_labels.clear()
+            transformed.clear()
+
+        for idx in range(len(new_subset)):
+            image, label = new_subset[idx]
+            raw_images.append(image)
+            raw_labels.append(label)
+            transformed.append(TEST_TRANSFORM(image))
+            if len(transformed) == self.cfg.batch_size:
+                flush_batch()
+        flush_batch()
+
+        flagged_samples.sort(key=lambda item: float(item["energy"]), reverse=True)
+        cached_samples = flagged_samples[:self.cfg.ood_cache_max_per_task]
+        flagged_count = len(flagged_samples)
+        flagged_ratio = flagged_count / max(len(new_subset), 1)
+        active = (
+            flagged_count >= self.cfg.ood_trigger_min_count
+            and flagged_ratio >= self.cfg.ood_trigger_min_ratio
+        )
+
+        self.offline_ood_cache[task_id] = cached_samples
+        event = {
+            "task_id": int(task_id),
+            "threshold": float(threshold),
+            "flagged_count": float(flagged_count),
+            "flagged_ratio": float(flagged_ratio),
+            "cache_size": float(len(cached_samples)),
+            "active": float(1.0 if active else 0.0),
+        }
+        self.ood_trigger_log.append(event)
+
+        print(
+            f"  Offline OOD cache: {flagged_count} flagged / {len(new_subset)} "
+            f"({flagged_ratio * 100:.1f}%), threshold={threshold:.4f}, "
+            f"activate_expert={'yes' if active else 'no'}"
+        )
+        return {
+            "enabled": True,
+            "active": active,
+            "threshold": threshold,
+            "flagged_count": flagged_count,
+            "flagged_ratio": flagged_ratio,
+            "cache_size": len(cached_samples),
+        }
+
     def _update_exemplars(
         self,
         train_dataset,
@@ -442,11 +634,41 @@ class CILTrainer:
             ood_auroc = np.array([m.get("auroc", 0.0) for m in self.ood_metrics_log])
             ood_fpr = np.array([m.get("fpr_at_95tpr", 1.0) for m in self.ood_metrics_log])
             ood_task_ids = np.array([int(m.get("task_id", i)) for i, m in enumerate(self.ood_metrics_log)])
+            ood_threshold = np.array([m.get("threshold", np.nan) for m in self.ood_metrics_log], dtype=float)
+            ood_id_mean_energy = np.array([m.get("id_mean_energy", np.nan) for m in self.ood_metrics_log], dtype=float)
+            ood_ood_mean_energy = np.array([m.get("ood_mean_energy", np.nan) for m in self.ood_metrics_log], dtype=float)
             save_dict["ood_auroc"] = ood_auroc
             save_dict["ood_fpr_at_95tpr"] = ood_fpr
             save_dict["ood_task_ids"] = ood_task_ids
+            save_dict["ood_threshold"] = ood_threshold
+            save_dict["ood_id_mean_energy"] = ood_id_mean_energy
+            save_dict["ood_ood_mean_energy"] = ood_ood_mean_energy
+
+        if self.ood_trigger_log:
+            trigger_task_ids = np.array([int(m.get("task_id", i + 1)) for i, m in enumerate(self.ood_trigger_log)], dtype=int)
+            trigger_threshold = np.array([m.get("threshold", np.nan) for m in self.ood_trigger_log], dtype=float)
+            trigger_flagged_count = np.array([m.get("flagged_count", 0.0) for m in self.ood_trigger_log], dtype=float)
+            trigger_flagged_ratio = np.array([m.get("flagged_ratio", 0.0) for m in self.ood_trigger_log], dtype=float)
+            trigger_cache_size = np.array([m.get("cache_size", 0.0) for m in self.ood_trigger_log], dtype=float)
+            trigger_active = np.array([m.get("active", 0.0) for m in self.ood_trigger_log], dtype=float)
+            save_dict["ood_trigger_task_ids"] = trigger_task_ids
+            save_dict["ood_trigger_threshold"] = trigger_threshold
+            save_dict["ood_trigger_flagged_count"] = trigger_flagged_count
+            save_dict["ood_trigger_flagged_ratio"] = trigger_flagged_ratio
+            save_dict["ood_trigger_cache_size"] = trigger_cache_size
+            save_dict["ood_trigger_active"] = trigger_active
 
         np.savez(metrics_path, **save_dict)
+        if self.model is not None:
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            self.model_stats = {
+                "total_params": int(total_params),
+                "trainable_params": int(trainable_params),
+                "trainable_ratio": float(trainable_params / max(total_params, 1)),
+            }
+            with (output_dir / "model_stats.json").open("w", encoding="utf-8") as handle:
+                json.dump(self.model_stats, handle, indent=2)
 
         global_max_mem = float(np.max(max_memory_mb)) if max_memory_mb.size > 0 else 0.0
         valid_old_acc = old_task_acc[np.isfinite(old_task_acc)]
@@ -467,6 +689,15 @@ class CILTrainer:
             last_ood = self.ood_metrics_log[-1]
             print(f"  OOD AUROC (final): {last_ood.get('auroc', 0):.4f}")
             print(f"  OOD FPR@95TPR (final): {last_ood.get('fpr_at_95tpr', 1):.4f}")
+            print(f"  OOD Threshold (final): {last_ood.get('threshold', float('nan')):.4f}")
+        if self.ood_trigger_log:
+            last_trigger = self.ood_trigger_log[-1]
+            print(
+                f"  Offline OOD Cache (last task): "
+                f"{int(last_trigger.get('flagged_count', 0))} samples, "
+                f"ratio={last_trigger.get('flagged_ratio', 0.0) * 100:.2f}%, "
+                f"activate_expert={'yes' if last_trigger.get('active', 0.0) > 0.5 else 'no'}"
+            )
 
         print(f"  Runtime metrics saved to {metrics_path}")
 
@@ -499,7 +730,6 @@ class CILTrainer:
         )
 
     def _serialize_exemplar_sets(self) -> Dict[int, List[Tuple[torch.Tensor, int]]]:
-        from torchvision.transforms.functional import to_tensor
         serialized = {}
         for class_id, samples in self.exemplar_sets.items():
             packed = []
@@ -514,7 +744,6 @@ class CILTrainer:
         return serialized
 
     def _deserialize_exemplar_sets(self, payload: Dict) -> Dict[int, List[Tuple]]:
-        from torchvision.transforms.functional import to_pil_image
         restored = {}
         for class_id, samples in payload.items():
             normalized = []
@@ -526,6 +755,53 @@ class CILTrainer:
                 normalized.append((pil_image, int(label)))
             restored[int(class_id)] = normalized
         return restored
+
+    def _serialize_offline_ood_cache(self) -> Dict[int, List[Dict[str, object]]]:
+        serialized = {}
+        for task_id, samples in self.offline_ood_cache.items():
+            packed = []
+            for sample in samples:
+                image = sample["image"]
+                if torch.is_tensor(image):
+                    image_tensor = image.detach().cpu()
+                else:
+                    image_tensor = to_tensor(image).cpu()
+                packed.append({
+                    "image": image_tensor,
+                    "label": int(sample["label"]),
+                    "energy": float(sample["energy"]),
+                    "trigger_strength": float(sample["trigger_strength"]),
+                })
+            serialized[int(task_id)] = packed
+        return serialized
+
+    def _deserialize_offline_ood_cache(self, payload: Dict) -> Dict[int, List[Dict[str, object]]]:
+        restored = {}
+        for task_id, samples in payload.items():
+            normalized = []
+            for sample in samples:
+                image = sample["image"]
+                if not torch.is_tensor(image):
+                    image = torch.as_tensor(image)
+                normalized.append({
+                    "image": to_pil_image(image.cpu()),
+                    "label": int(sample["label"]),
+                    "energy": float(sample["energy"]),
+                    "trigger_strength": float(sample["trigger_strength"]),
+                })
+            restored[int(task_id)] = normalized
+        return restored
+
+    def _save_offline_ood_cache(self, output_dir: Path) -> None:
+        if not self.offline_ood_cache:
+            return
+        cache_path = output_dir / "offline_ood_buffer.pt"
+        summary_path = output_dir / "ood_trigger_events.json"
+        torch.save(self._serialize_offline_ood_cache(), cache_path)
+        with summary_path.open("w", encoding="utf-8") as handle:
+            json.dump(self.ood_trigger_log, handle, indent=2)
+        print(f"Offline OOD cache saved to {cache_path}")
+        print(f"OOD trigger summary saved to {summary_path}")
 
     def _serialize_projector_bases(self) -> Dict[str, torch.Tensor]:
         if self.projector is None:
@@ -590,6 +866,9 @@ class CILTrainer:
             },
             "ood_metrics_log": list(self.ood_metrics_log),
             "energy_thresholds": list(self.energy_thresholds),
+            "ood_trigger_log": list(self.ood_trigger_log),
+            "offline_ood_cache": self._serialize_offline_ood_cache(),
+            "model_stats": dict(self.model_stats),
             "runtime_metrics": runtime_metrics,
             "best_aa_so_far": float(self.best_aa),
             "best_task_id": int(self.best_task_id),
@@ -697,6 +976,11 @@ class CILTrainer:
 
         self.ood_metrics_log = list(checkpoint.get("ood_metrics_log", []))
         self.energy_thresholds = list(checkpoint.get("energy_thresholds", []))
+        self.ood_trigger_log = list(checkpoint.get("ood_trigger_log", []))
+        self.offline_ood_cache = self._deserialize_offline_ood_cache(
+            checkpoint.get("offline_ood_cache", {})
+        )
+        self.model_stats = dict(checkpoint.get("model_stats", {}))
 
         runtime_metrics = checkpoint.get("runtime_metrics", {})
         self.task_old_task_accuracy = list(runtime_metrics.get("task_old_task_accuracy", []))
@@ -771,6 +1055,8 @@ class CILTrainer:
             self.epoch_records = []
             self.ood_metrics_log = []
             self.energy_thresholds = []
+            self.ood_trigger_log = []
+            self.offline_ood_cache = {}
             self.best_aa = float("-inf")
             self.best_task_id = -1
             if self.projector is not None:
@@ -788,6 +1074,8 @@ class CILTrainer:
             modules.append(f"MoE ({self.cfg.num_experts} experts, top-{self.cfg.top_k})")
         if self.cfg.use_energy_ood:
             modules.append("Energy OOD")
+        if self.cfg.use_ood_expert_routing:
+            modules.append("Offline OOD-triggered expert routing")
         if self.cfg.use_ortho_proj:
             modules.append(f"Orthogonal Projection (rank≤{self.cfg.ortho_max_rank})")
         if self.cfg.der_alpha > 0:
@@ -823,17 +1111,33 @@ class CILTrainer:
                 total_params = sum(p.numel() for p in self.model.parameters())
                 trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
                 print(f"  Total params: {total_params:,} | Trainable: {trainable:,} ({100*trainable/total_params:.1f}%)")
+                trigger_state = {"enabled": False, "active": False}
             else:
                 if self.model is None:
                     raise RuntimeError("Model state is missing before incremental expansion.")
                 self.old_model = self.model.freeze_copy()
+                trigger_state = {"enabled": False, "active": False}
+                if self.cfg.use_ood_expert_routing and self.cfg.use_moe:
+                    trigger_state = self._collect_offline_ood_cache(
+                        train_dataset,
+                        new_classes,
+                        task_id,
+                    )
                 self.model.expand_classes(
                     len(new_classes),
                     scale_matched_head_init=self.cfg.scale_matched_head_init,
                 )
-                if self.cfg.use_moe and self.cfg.add_expert_per_task:
-                    self.model.add_moe_experts(num_new=1)
-                    print(f"  Added 1 new expert per MoE layer")
+                if self.cfg.use_moe:
+                    add_expert = False
+                    if self.cfg.use_ood_expert_routing:
+                        add_expert = bool(trigger_state.get("active", False))
+                    elif self.cfg.add_expert_per_task:
+                        add_expert = True
+                    if add_expert:
+                        self.model.add_moe_experts(num_new=1)
+                        print("  Added 1 new expert per MoE layer")
+                    elif self.cfg.use_ood_expert_routing:
+                        print("  No expert activated for this task (offline OOD trigger below threshold)")
 
             exemplars = self._get_all_exemplars() if task_id > 0 else None
             train_loader, _ = get_task_dataloaders(
@@ -846,7 +1150,12 @@ class CILTrainer:
                 oversample_exemplars=self.cfg.oversample_exemplars,
             )
 
-            train_stats = self._train_one_task(train_loader, task_id, num_old_classes)
+            train_stats = self._train_one_task(
+                train_loader,
+                task_id,
+                num_old_classes,
+                trigger_state=trigger_state,
+            )
             peak_mem = max(train_stats["epoch_peak_memory_mb"]) if train_stats["epoch_peak_memory_mb"] else 0.0
             avg_epoch_time = (
                 float(np.mean(train_stats["epoch_time_sec"]))
@@ -901,6 +1210,9 @@ class CILTrainer:
                     self.ood_metrics_log.append(ood_results)
                     self.writer.add_scalar("OOD/AUROC", ood_results["auroc"], task_id)
                     self.writer.add_scalar("OOD/FPR_at_95TPR", ood_results["fpr_at_95tpr"], task_id)
+                    self.writer.add_scalar("OOD/Threshold", ood_results["threshold"], task_id)
+                    self.writer.add_scalar("OOD/ID_Mean_Energy", ood_results["id_mean_energy"], task_id)
+                    self.writer.add_scalar("OOD/OOD_Mean_Energy", ood_results["ood_mean_energy"], task_id)
                     print(f"    AUROC: {ood_results['auroc']:.4f} | "
                           f"FPR@95TPR: {ood_results['fpr_at_95tpr']:.4f} | "
                           f"Threshold: {ood_results['threshold']:.4f}")
@@ -952,6 +1264,7 @@ class CILTrainer:
         output_dir.mkdir(parents=True, exist_ok=True)
         np.save(output_dir / "acc_matrix.npy", self.acc_matrix)
         self._save_runtime_metrics(output_dir)
+        self._save_offline_ood_cache(output_dir)
         print(f"\nAccuracy matrix saved to {output_dir / 'acc_matrix.npy'}")
 
         self.writer.close()

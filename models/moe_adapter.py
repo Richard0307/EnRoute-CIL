@@ -76,6 +76,7 @@ class MoEAdapterLayer(nn.Module):
 
         self.balance_loss_coeff = 0.01
         self._last_balance_loss = torch.tensor(0.0)
+        self._last_gate_scores: torch.Tensor | None = None
 
     @property
     def num_experts(self) -> int:
@@ -91,6 +92,7 @@ class MoEAdapterLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_scores, top_indices, top_weights = self.router(x)
         self._last_balance_loss = self._compute_balance_loss(gate_scores)
+        self._last_gate_scores = gate_scores
 
         output = torch.zeros_like(x)
         for k in range(self.top_k):
@@ -124,6 +126,39 @@ class MoEAdapterLayer(nn.Module):
 
     def get_balance_loss(self) -> torch.Tensor:
         return self._last_balance_loss
+
+    def get_trigger_alignment_loss(self, trigger_strength: torch.Tensor) -> torch.Tensor:
+        if self._last_gate_scores is None or self.num_experts < 2:
+            return torch.tensor(0.0, device=trigger_strength.device)
+
+        gate_scores = self._last_gate_scores
+        if gate_scores.shape[0] != trigger_strength.shape[0]:
+            return torch.tensor(0.0, device=gate_scores.device)
+
+        trigger_strength = trigger_strength.to(gate_scores.device).clamp(0.0, 1.0)
+        target = torch.zeros_like(gate_scores)
+
+        old_scores = gate_scores.detach().clone()
+        old_scores[:, -1] = 0.0
+        old_mass = old_scores[:, :-1].sum(dim=1, keepdim=True)
+        uniform_old = torch.full_like(
+            old_scores[:, :-1],
+            1.0 / float(self.num_experts - 1),
+        )
+        old_probs = torch.where(
+            old_mass > 1e-8,
+            old_scores[:, :-1] / old_mass.clamp_min(1e-8),
+            uniform_old,
+        )
+
+        target[:, :-1] = old_probs * (1.0 - trigger_strength).unsqueeze(1)
+        target[:, -1] = trigger_strength
+
+        return F.kl_div(
+            gate_scores.clamp_min(1e-8).log(),
+            target,
+            reduction="batchmean",
+        )
 
     def get_routing_stats(self) -> dict:
         return {

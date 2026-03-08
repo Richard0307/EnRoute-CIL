@@ -9,7 +9,7 @@ import torch
 
 from config import Config
 from trainer import CILTrainer
-from utils.data_utils import build_cifar100_tasks
+from utils.data_utils import build_incremental_tasks
 
 
 def set_seed(seed: int) -> None:
@@ -27,8 +27,11 @@ def parse_args() -> Config:
 
     parser.add_argument("--dataset", type=str, default=cfg.dataset)
     parser.add_argument("--data_root", type=str, default=cfg.data_root)
+    parser.add_argument("--class_order_path", type=str, default=cfg.class_order_path)
+    parser.add_argument("--num_workers", type=int, default=cfg.num_workers)
     parser.add_argument("--init_classes", type=int, default=cfg.init_classes)
     parser.add_argument("--inc_classes", type=int, default=cfg.inc_classes)
+    parser.add_argument("--max_tasks", type=int, default=cfg.max_tasks)
 
     parser.add_argument("--backbone", type=str, default=cfg.backbone)
     parser.add_argument("--adapter_bottleneck", type=int, default=cfg.adapter_bottleneck)
@@ -43,6 +46,12 @@ def parse_args() -> Config:
     parser.add_argument("--use_energy_ood", action="store_true")
     parser.add_argument("--energy_temperature", type=float, default=cfg.energy_temperature)
     parser.add_argument("--ood_percentile", type=float, default=cfg.ood_percentile)
+    parser.add_argument("--use_ood_expert_routing", action="store_true")
+    parser.add_argument("--ood_router_lambda", type=float, default=cfg.ood_router_lambda)
+    parser.add_argument("--ood_router_temperature", type=float, default=cfg.ood_router_temperature)
+    parser.add_argument("--ood_trigger_min_count", type=int, default=cfg.ood_trigger_min_count)
+    parser.add_argument("--ood_trigger_min_ratio", type=float, default=cfg.ood_trigger_min_ratio)
+    parser.add_argument("--ood_cache_max_per_task", type=int, default=cfg.ood_cache_max_per_task)
 
     parser.add_argument("--use_moe", action="store_true")
     parser.add_argument("--num_experts", type=int, default=cfg.num_experts)
@@ -66,10 +75,12 @@ def parse_args() -> Config:
     parser.add_argument("--resume_path", type=str, default=cfg.resume_path)
     parser.add_argument("--save_best", action="store_true")
     parser.add_argument("--no_auto_checkpoint", action="store_true")
+    parser.add_argument("--no_auto_plots", action="store_true")
 
     args = parser.parse_args()
     args_dict = vars(args)
     disable_auto_checkpoint = args_dict.pop("no_auto_checkpoint")
+    disable_auto_plots = args_dict.pop("no_auto_plots")
     no_wa = args_dict.pop("no_wa")
     no_online_exemplar_aug = args_dict.pop("no_online_exemplar_aug")
     no_oversample = args_dict.pop("no_oversample")
@@ -83,6 +94,7 @@ def parse_args() -> Config:
     if args.no_add_expert:
         cfg.add_expert_per_task = False
     cfg.auto_checkpoint = not disable_auto_checkpoint
+    cfg.auto_plots = not disable_auto_plots
     if no_wa:
         cfg.use_wa = False
     if no_online_exemplar_aug:
@@ -106,6 +118,10 @@ def main() -> None:
     print()
 
     trainer = CILTrainer(cfg)
+    if cfg.use_ood_expert_routing and not (cfg.use_energy_ood and cfg.use_moe):
+        raise SystemExit(
+            "[Error] --use_ood_expert_routing requires both --use_energy_ood and --use_moe."
+        )
     resume_checkpoint = None
     if cfg.resume:
         try:
@@ -114,12 +130,16 @@ def main() -> None:
         except FileNotFoundError as exc:
             raise SystemExit(f"[Error] {exc}") from exc
 
-    task_classes, train_dataset, test_dataset = build_cifar100_tasks(
+    task_classes, train_dataset, test_dataset = build_incremental_tasks(
+        dataset=cfg.dataset,
         data_root=cfg.data_root,
         init_classes=cfg.init_classes,
         inc_classes=cfg.inc_classes,
         seed=cfg.seed,
+        class_order_path=cfg.class_order_path,
     )
+    if cfg.max_tasks > 0:
+        task_classes = task_classes[:cfg.max_tasks]
 
     print(f"Total tasks: {len(task_classes)}")
     for i, classes in enumerate(task_classes):
@@ -144,21 +164,22 @@ def main() -> None:
     print(f"Average Forgetting (AF): {compute_average_forgetting(acc_matrix):.4f}")
     print(f"\nFull accuracy matrix saved to: {cfg.output_dir}/acc_matrix.npy")
 
-    runtime_metrics_path = Path(cfg.output_dir) / "training_metrics.npz"
-    try:
-        from scripts.plot_results import generate_all_plots
-        plot_paths = generate_all_plots(
-            acc_matrix=acc_matrix,
-            output_dir=cfg.output_dir,
-            runtime_metrics_path=runtime_metrics_path,
-            verbose=False,
-        )
-    except Exception as exc:
-        print(f"\n[Warning] Failed to generate plots automatically: {exc}")
-    else:
-        print("\nGenerated plots:")
-        for plot_name, plot_path in plot_paths.items():
-            print(f"  {plot_name}: {plot_path}")
+    if cfg.auto_plots:
+        runtime_metrics_path = Path(cfg.output_dir) / "training_metrics.npz"
+        try:
+            from scripts.plot_results import generate_all_plots
+            plot_paths = generate_all_plots(
+                acc_matrix=acc_matrix,
+                output_dir=cfg.output_dir,
+                runtime_metrics_path=runtime_metrics_path,
+                verbose=False,
+            )
+        except Exception as exc:
+            print(f"\n[Warning] Failed to generate plots automatically: {exc}")
+        else:
+            print("\nGenerated plots:")
+            for plot_name, plot_path in plot_paths.items():
+                print(f"  {plot_name}: {plot_path}")
 
 
 if __name__ == "__main__":

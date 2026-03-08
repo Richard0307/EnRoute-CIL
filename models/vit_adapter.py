@@ -133,6 +133,15 @@ class CILModel(nn.Module):
                 total = total + bl.cpu() if bl.device != total.device else total + bl
         return total
 
+    def get_moe_trigger_alignment_loss(self, trigger_strength: torch.Tensor) -> torch.Tensor:
+        if not self.use_moe:
+            return torch.tensor(0.0, device=trigger_strength.device)
+        total = torch.tensor(0.0, device=trigger_strength.device)
+        for block in self.backbone.blocks:
+            if isinstance(block, MoEAdaptedBlock):
+                total = total + block.moe_adapter.get_trigger_alignment_loss(trigger_strength)
+        return total
+
     def get_trainable_params(self) -> list:
         params = []
         for name, param in self.named_parameters():
