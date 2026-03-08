@@ -4,11 +4,11 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![DOI](https://zenodo.org/badge/1167839322.svg)](https://doi.org/10.5281/zenodo.18873097)
 
-Official implementation of **ERO-MoE-CIL**, a parameter-efficient class-incremental learning framework for privacy-preserving intelligent cockpit personalization. On Split CIFAR-100 (`50 + 10 x 5`), ERO-MoE-CIL achieves **87.01% AA** and **8.04% AF** (3-seed mean), reducing forgetting by **46%** relative to the frozen-ViT baseline.
+Official implementation of **ERO-MoE-CIL**, a parameter-efficient class-incremental learning framework for privacy-preserving intelligent cockpit personalization. On Split CIFAR-100 (`50 + 10 x 5`), the full pipeline achieves **86.84% AA** and **7.87% AF** (3-seed mean), reducing forgetting by **44.7%** relative to the 3-seed frozen-ViT `Adapter + KD` baseline.
 
 ## Abstract
 
-In-cabin AI systems must continually adapt to new user-specific behaviors after deployment while preserving prior knowledge and protecting sensitive personal data. We propose ERO-MoE-CIL, a continual learning framework that combines a frozen Vision Transformer backbone with parameter-efficient Mixture-of-Experts adapters, exemplar replay with online augmentation, knowledge distillation, orthogonal gradient projection, and energy-based open-world detection. The system is designed for on-device learning under memory and compute constraints without cloud upload of raw cockpit data. On the Split CIFAR-100 benchmark, ERO-MoE-CIL reduces Average Forgetting from 14.88% to 8.04% while improving Average Accuracy from 85.03% to 87.01%, with stable performance across multiple random seeds.
+In-cabin AI systems must continually adapt to new user-specific behaviors after deployment while preserving prior knowledge and protecting sensitive personal data. We propose ERO-MoE-CIL, a continual learning framework that combines a frozen Vision Transformer backbone with parameter-efficient Mixture-of-Experts adapters, exemplar replay with online augmentation, knowledge distillation, orthogonal gradient projection, and energy-based open-world detection. The system is designed for on-device learning under memory and compute constraints without cloud upload of raw cockpit data. Under a fair 4-group x 3-seed comparison on Split CIFAR-100, the full ERO-MoE-CIL pipeline improves Average Accuracy from 85.10% to 86.84% and reduces Average Forgetting from 14.23% to 7.87% relative to the 3-seed `Adapter + KD` baseline, while showing that replay-pipeline repair is the dominant factor behind the observed gain in this frozen-ViT replay-based setting.
 
 ## Method Overview
 The framework consists of the following components:
@@ -210,17 +210,18 @@ python scripts/plot_results.py \
 
 ## Main Results
 
-All experiments are evaluated on Split CIFAR-100 (`50 + 10 x 5`, 6 tasks). Multi-seed results report mean ± std over 3 independent runs with seeds `{42, 43, 44}`. Single-seed baselines use seed `42`.
+All experiments are evaluated on Split CIFAR-100 (`50 + 10 x 5`, 6 tasks). The main comparison below reports mean +/- std over 3 independent runs with seeds `{42, 43, 44}` for all four configurations.
 
-### Comparison with Baseline
+### Fair Comparison (4 Groups x 3 Seeds)
 
-| Method | Epochs | AA (%) | AF (%) | Seeds |
-|:---|---:|---:|---:|---:|
-| Frozen ViT + Adapter + KD (baseline) | 5 | 85.03 | 14.88 | 1 |
-| + MoE + Energy OOD + OP | 5 | 84.89 | 14.54 | 1 |
-| **ERO-MoE-CIL (full)** | **5** | **87.01 ± 0.75** | **8.04 ± 0.69** | **3** |
+| Configuration | AA (%) | AF (%) | Final Old-Task Acc (%) | Final OOD AUROC | Delta AA vs Baseline | Delta AF vs Baseline |
+|:---|---:|---:|---:|---:|---:|---:|
+| Baseline (`Adapter + KD`) | 85.10 ± 1.38 | 14.23 ± 1.73 | 82.54 ± 1.76 | - | 0.00 | 0.00 |
+| + MoE + Energy OOD + OP | 83.17 ± 1.67 | 16.06 ± 1.83 | 80.39 ± 1.90 | 0.7844 ± 0.0122 | -1.93 | +1.83 |
+| + DER++ + WA | 81.28 ± 1.79 | 18.72 ± 1.86 | 78.07 ± 2.15 | 0.7246 ± 0.0386 | -3.82 | +4.49 |
+| **+ Online Aug + Oversample + Head Init (Full)** | **86.84 ± 0.89** | **7.87 ± 0.51** | **86.07 ± 0.79** | **0.7950 ± 0.0131** | **+1.74** | **-6.36** |
 
-The full method improves AA by **+2.0%** and reduces AF by **-6.8%** over the baseline, indicating that the replay-level fixes (online exemplar augmentation, oversampling, classifier initialization) contribute more to forgetting reduction than the loss-level additions (DER++, WA) alone.
+The fair 3-seed comparison supports a narrower but stronger claim than the previous draft: in this replay-based frozen-ViT setting, adding `MoE + Energy OOD + OP` and later `DER++ + WA` does not improve performance while the replay pipeline remains unrepaired, and both intermediate configurations underperform the `Adapter + KD` baseline. Once online exemplar augmentation, balanced oversampling, and scale-matched classifier expansion are enabled, the same framework becomes the strongest configuration, improving AA by **+1.74** points and reducing AF by **-6.36** points (**44.7% relative**) over the baseline.
 
 ### Per-Seed Breakdown
 
@@ -228,28 +229,28 @@ The full method improves AA by **+2.0%** and reduces AF by **-6.8%** over the ba
 
 | Seed | AA (%) | AF (%) |
 |---:|---:|---:|
-| 42 | 88.06 | 7.58 |
-| 43 | 86.53 | 7.54 |
-| 44 | 86.43 | 9.02 |
-| **mean ± std** | **87.01 ± 0.75** | **8.04 ± 0.69** |
+| 42 | 88.05 | 7.58 |
+| 43 | 86.55 | 7.43 |
+| 44 | 85.93 | 8.58 |
+| **mean ± std** | **86.84 ± 0.89** | **7.87 ± 0.51** |
 
 <!-- MULTISEED_RESULTS_END -->
 
-### Ablation Study
+### Stage-wise Effect of Component Groups
 
-To isolate the contribution of each component, the following ablations are reported on seed `42` with 5 epochs per task:
+The stage-wise deltas below show what each group of components contributed when all rows are compared under the same 3-seed protocol:
 
-| Configuration | AA (%) | AF (%) | Delta AA | Delta AF |
-|:---|---:|---:|---:|---:|
-| Baseline (Adapter + KD) | 85.03 | 14.88 | — | — |
-| + MoE + OOD + OP | 84.89 | 14.54 | -0.14 | -0.34 |
-| + DER++ + WA | 84.84 | 15.00 | -0.19 | +0.12 |
-| + Online augmentation + oversampling + head init | 88.17 | 8.17 | **+3.14** | **-6.71** |
+| Transition | Delta AA | Delta AF | Delta Final Old-Task Acc |
+|:---|---:|---:|---:|
+| Baseline -> + MoE + Energy OOD + OP | -1.93 | +1.83 | -2.15 |
+| + MoE + Energy OOD + OP -> + DER++ + WA | -1.88 | +2.66 | -2.32 |
+| + DER++ + WA -> + Online Aug + Oversample + Head Init (Full) | **+5.56** | **-10.85** | **+8.00** |
 
 Key observations:
-- Adding MoE, OOD, and orthogonal projection alone does not significantly reduce forgetting.
-- DER++ and WA without replay-level fixes slightly *increase* AF, because the exemplar data pipeline was the dominant bottleneck.
-- Online exemplar augmentation, balanced oversampling, and matched classifier initialization together account for the majority of improvement.
+- `MoE + Energy OOD + OP` alone does not provide a positive gain under the unrepaired replay pipeline.
+- `DER++ + WA` on top of that setting further reduces AA and worsens AF.
+- The decisive performance jump appears only after enabling online exemplar augmentation, balanced oversampling, and scale-matched classifier expansion.
+- This README claim is intentionally bounded to the current replay-based frozen-ViT setting; it is not stated as a universal conclusion for all PEFT-CIL methods.
 
 ### Accuracy Matrix (Seed 42, Full Method)
 
@@ -257,12 +258,12 @@ Each cell `(i, j)` shows accuracy on task `j` after training on task `i`.
 
 |  | T0 | T1 | T2 | T3 | T4 | T5 |
 |---:|---:|---:|---:|---:|---:|---:|
-| After T0 | 92.66 | — | — | — | — | — |
-| After T1 | 90.48 | 97.10 | — | — | — | — |
-| After T2 | 86.74 | 94.60 | 94.40 | — | — | — |
-| After T3 | 81.60 | 90.50 | 94.50 | 97.60 | — | — |
-| After T4 | 78.42 | 88.90 | 89.30 | 97.20 | 92.20 | — |
-| After T5 | 75.06 | 87.80 | 86.40 | 93.60 | 93.30 | 92.20 |
+| After T0 | 93.02 | — | — | — | — | — |
+| After T1 | 90.32 | 97.10 | — | — | — | — |
+| After T2 | 86.72 | 95.10 | 93.90 | — | — | — |
+| After T3 | 82.66 | 92.30 | 95.20 | 96.30 | — | — |
+| After T4 | 79.14 | 89.10 | 92.40 | 96.10 | 92.20 | — |
+| After T5 | 75.72 | 87.70 | 88.30 | 92.30 | 91.90 | 92.40 |
 
 ## Reproducibility Notes
 - All results can be reproduced using the commands in [Training Commands](#training-commands).
