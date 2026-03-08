@@ -3,6 +3,8 @@
  * https://github.com/salesforce/BLIP
 '''
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,7 +13,57 @@ from functools import partial
 from timm.models.vision_transformer import _cfg, PatchEmbed
 from timm.models.registry import register_model
 from timm.models.layers import trunc_normal_, DropPath
-from timm.models.helpers import named_apply, adapt_input_conv
+
+try:
+    from timm.models.helpers import named_apply, adapt_input_conv
+except ImportError:
+    try:
+        from timm.models import named_apply  # timm>=0.9
+    except ImportError:
+        def named_apply(fn, module, name='', depth_first=True, include_root=False):
+            if not depth_first and include_root:
+                fn(module, name)
+            for child_name, child_module in module.named_children():
+                child_name = '.'.join((name, child_name)) if name else child_name
+                named_apply(
+                    fn=fn,
+                    module=child_module,
+                    name=child_name,
+                    depth_first=depth_first,
+                    include_root=True,
+                )
+            if depth_first and include_root:
+                fn(module, name)
+            return module
+
+    try:
+        from timm.models.helpers import adapt_input_conv
+    except ImportError:
+        def adapt_input_conv(in_chans, conv_weight):
+            conv_type = conv_weight.dtype
+            conv_weight = conv_weight.float()
+            out_channels, in_channels, kernel_h, kernel_w = conv_weight.shape
+            if in_chans == 1:
+                if in_channels > 3:
+                    if in_channels % 3 != 0:
+                        raise NotImplementedError(
+                            'Unsupported conv format for grayscale input adaptation.'
+                        )
+                    conv_weight = conv_weight.reshape(
+                        out_channels, in_channels // 3, 3, kernel_h, kernel_w
+                    )
+                    conv_weight = conv_weight.sum(dim=2)
+                else:
+                    conv_weight = conv_weight.sum(dim=1, keepdim=True)
+            elif in_chans != 3:
+                if in_channels != 3:
+                    raise NotImplementedError(
+                        'Input channel adaptation only supports pretrained 3-channel convs.'
+                    )
+                repeats = int(math.ceil(float(in_chans) / 3.0))
+                conv_weight = conv_weight.repeat(1, repeats, 1, 1)[:, :in_chans, :, :]
+                conv_weight *= 3.0 / float(in_chans)
+            return conv_weight.to(conv_type)
 
 class Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
