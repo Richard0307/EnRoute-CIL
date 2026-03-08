@@ -1,15 +1,4 @@
-"""
-Entry point for Open-World CIL experiments (ERO-MoE-CIL).
-
-Usage:
-    python main.py                                  # Baseline adapter + KD
-    python main.py --use_moe                        # + MoE routing
-    python main.py --use_moe --use_energy_ood       # + Energy OOD detection
-    python main.py --use_moe --use_ortho_proj       # + Orthogonal projection
-    python main.py --use_moe --use_energy_ood --use_ortho_proj  # Full pipeline
-    python main.py --resume                          # Resume from latest checkpoint
-    python main.py --save_best                       # Save best checkpoint by AA
-"""
+"""Entry point for ERO-MoE-CIL experiments."""
 
 import argparse
 from pathlib import Path
@@ -36,72 +25,56 @@ def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="ERO-MoE-CIL for Intelligent Cockpit")
     cfg = Config()
 
-    # Dataset & schedule
     parser.add_argument("--dataset", type=str, default=cfg.dataset)
     parser.add_argument("--data_root", type=str, default=cfg.data_root)
     parser.add_argument("--init_classes", type=int, default=cfg.init_classes)
     parser.add_argument("--inc_classes", type=int, default=cfg.inc_classes)
 
-    # Model
     parser.add_argument("--backbone", type=str, default=cfg.backbone)
     parser.add_argument("--adapter_bottleneck", type=int, default=cfg.adapter_bottleneck)
     parser.add_argument("--exemplars_per_class", type=int, default=cfg.exemplars_per_class)
 
-    # Training
     parser.add_argument("--epochs", type=int, default=cfg.epochs)
     parser.add_argument("--batch_size", type=int, default=cfg.batch_size)
     parser.add_argument("--lr_adapter", type=float, default=cfg.lr_adapter)
     parser.add_argument("--kd_lambda", type=float, default=cfg.kd_lambda)
     parser.add_argument("--kd_temperature", type=float, default=cfg.kd_temperature)
 
-    # Module B: Energy OOD
-    parser.add_argument("--use_energy_ood", action="store_true",
-                        help="Enable energy-based OOD detection (Module B)")
+    parser.add_argument("--use_energy_ood", action="store_true")
     parser.add_argument("--energy_temperature", type=float, default=cfg.energy_temperature)
     parser.add_argument("--ood_percentile", type=float, default=cfg.ood_percentile)
 
-    # Module C: MoE
-    parser.add_argument("--use_moe", action="store_true",
-                        help="Enable MoE adapters (Module C)")
+    parser.add_argument("--use_moe", action="store_true")
     parser.add_argument("--num_experts", type=int, default=cfg.num_experts)
     parser.add_argument("--top_k", type=int, default=cfg.top_k)
-    parser.add_argument("--no_add_expert", action="store_true",
-                        help="Disable adding new expert per task")
+    parser.add_argument("--no_add_expert", action="store_true")
 
-    # Module D extension: Orthogonal Projection
-    parser.add_argument("--use_ortho_proj", action="store_true",
-                        help="Enable orthogonal gradient projection (Module D ext)")
+    parser.add_argument("--use_ortho_proj", action="store_true")
     parser.add_argument("--ortho_max_rank", type=int, default=cfg.ortho_max_rank)
 
-    # DER++ & WA
-    parser.add_argument("--der_alpha", type=float, default=cfg.der_alpha,
-                        help="DER++ MSE loss coefficient (0 to disable)")
-    parser.add_argument("--no_wa", action="store_true",
-                        help="Disable Weight Aligning")
-    parser.add_argument("--no_oversample", action="store_true",
-                        help="Disable exemplar oversampling")
+    parser.add_argument("--der_alpha", type=float, default=cfg.der_alpha)
+    parser.add_argument("--no_wa", action="store_true")
+    parser.add_argument("--no_online_exemplar_aug", action="store_true")
+    parser.add_argument("--no_oversample", action="store_true")
+    parser.add_argument("--no_scale_matched_head_init", action="store_true")
 
-    # System
     parser.add_argument("--device", type=str, default=cfg.device)
     parser.add_argument("--seed", type=int, default=cfg.seed)
     parser.add_argument("--output_dir", type=str, default=cfg.output_dir)
     parser.add_argument("--checkpoint_dir", type=str, default=cfg.checkpoint_dir)
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume training from a checkpoint")
-    parser.add_argument("--resume_path", type=str, default=cfg.resume_path,
-                        help="Path to checkpoint .pt file (default: latest checkpoint)")
-    parser.add_argument("--save_best", action="store_true",
-                        help="Save best checkpoint by AA as <checkpoint_dir>/best.pt")
-    parser.add_argument("--no_auto_checkpoint", action="store_true",
-                        help="Disable automatic checkpoint save after each task")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume_path", type=str, default=cfg.resume_path)
+    parser.add_argument("--save_best", action="store_true")
+    parser.add_argument("--no_auto_checkpoint", action="store_true")
 
     args = parser.parse_args()
     args_dict = vars(args)
     disable_auto_checkpoint = args_dict.pop("no_auto_checkpoint")
     no_wa = args_dict.pop("no_wa")
+    no_online_exemplar_aug = args_dict.pop("no_online_exemplar_aug")
     no_oversample = args_dict.pop("no_oversample")
+    no_scale_matched_head_init = args_dict.pop("no_scale_matched_head_init")
 
-    # Update config with parsed arguments
     for key, value in args_dict.items():
         if key == "no_add_expert":
             continue
@@ -112,8 +85,12 @@ def parse_args() -> Config:
     cfg.auto_checkpoint = not disable_auto_checkpoint
     if no_wa:
         cfg.use_wa = False
+    if no_online_exemplar_aug:
+        cfg.online_exemplar_augmentation = False
     if no_oversample:
         cfg.oversample_exemplars = False
+    if no_scale_matched_head_init:
+        cfg.scale_matched_head_init = False
 
     return cfg
 
@@ -137,7 +114,6 @@ def main() -> None:
         except FileNotFoundError as exc:
             raise SystemExit(f"[Error] {exc}") from exc
 
-    # Build incremental task schedule
     task_classes, train_dataset, test_dataset = build_cifar100_tasks(
         data_root=cfg.data_root,
         init_classes=cfg.init_classes,
@@ -150,7 +126,6 @@ def main() -> None:
         print(f"  Task {i}: {len(classes)} classes → {classes[:5]}{'...' if len(classes) > 5 else ''}")
     print()
 
-    # Run CIL training
     try:
         acc_matrix = trainer.run(
             task_classes,
@@ -161,7 +136,6 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(f"[Error] {exc}") from exc
 
-    # Final summary
     print("\n" + "=" * 60)
     print("FINAL RESULTS")
     print("=" * 60)

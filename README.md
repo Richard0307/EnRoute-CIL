@@ -114,27 +114,50 @@ python scripts/run_multiseed.py \
 ### Baseline (frozen ViT + Adapter + KD only)
 ```bash
 python main.py --epochs 5 --output_dir output/baseline --save_best \
-  --der_alpha 0 --no_wa --no_oversample
+  --der_alpha 0 --no_wa \
+  --no_online_exemplar_aug \
+  --no_oversample \
+  --no_scale_matched_head_init
 ```
 
 ### Ablation examples
 ```bash
 # + MoE only
 python main.py --epochs 5 --use_moe \
-  --der_alpha 0 --no_wa --no_oversample \
+  --der_alpha 0 --no_wa \
+  --no_online_exemplar_aug \
+  --no_oversample \
+  --no_scale_matched_head_init \
   --output_dir output/ablation_moe --save_best
 
 # + MoE + OOD + OP (no replay fixes)
 python main.py --epochs 5 --use_moe --use_energy_ood --use_ortho_proj \
-  --der_alpha 0 --no_wa --no_oversample \
+  --der_alpha 0 --no_wa \
+  --no_online_exemplar_aug \
+  --no_oversample \
+  --no_scale_matched_head_init \
   --output_dir output/ablation_moe_ood_op --save_best
 
-# Full method without DER++
+# + DER++ + WA (still without replay-pipeline fixes)
 python main.py --epochs 5 --use_moe --use_energy_ood --use_ortho_proj \
-  --der_alpha 0 --output_dir output/ablation_no_der --save_best
+  --der_alpha 0.3 \
+  --no_online_exemplar_aug \
+  --no_oversample \
+  --no_scale_matched_head_init \
+  --output_dir output/ablation_der_wa_only --save_best
+
+# Full method
+python main.py --epochs 5 --use_moe --use_energy_ood --use_ortho_proj \
+  --der_alpha 0.3 \
+  --output_dir output/ablation_full --save_best
 ```
 
-Available flags: `--no_wa` (disable weight aligning), `--no_oversample` (disable exemplar oversampling), `--der_alpha 0` (disable DER++).
+Available flags:
+- `--no_wa`: disable weight aligning
+- `--no_online_exemplar_aug`: replay exemplars are transformed once and then replayed as fixed tensors
+- `--no_oversample`: disable exemplar oversampling
+- `--no_scale_matched_head_init`: use default classifier-row initialization on class expansion
+- `--der_alpha 0`: disable DER++
 
 ## Checkpointing and Resume
 Automatic task-level checkpointing is enabled by default.

@@ -105,14 +105,17 @@ def get_task_dataloaders(
     num_workers: int = 4,
     exemplar_data: List[Tuple] = None,
     label_map: Dict[int, int] = None,
+    online_exemplar_augmentation: bool = True,
     oversample_exemplars: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build train/test DataLoaders for a specific incremental task.
 
     If exemplar_data is provided, it is mixed into the training set.
-    Exemplars are stored as raw PIL images and TRAIN_TRANSFORM is applied
-    on-the-fly so that data augmentation is re-applied each epoch.
+    Exemplars are stored as raw PIL images. When
+    ``online_exemplar_augmentation`` is True, TRAIN_TRANSFORM is applied
+    on-the-fly so that data augmentation is re-applied each epoch. When False,
+    exemplars are transformed once and cached as fixed tensors.
     """
     train_subset = ClassSubset(train_dataset, class_ids,
                                transform=TRAIN_TRANSFORM, label_map=label_map)
@@ -124,6 +127,7 @@ def get_task_dataloaders(
         train_subset = MixedDataset(
             train_subset, exemplar_data,
             exemplar_transform=TRAIN_TRANSFORM,
+            online_exemplar_augmentation=online_exemplar_augmentation,
             oversample_exemplars=oversample_exemplars,
         )
 
@@ -140,8 +144,9 @@ class MixedDataset(Dataset):
     """Combines a ClassSubset with exemplar replay data.
 
     Exemplars are stored as raw PIL images and transformed on-the-fly so that
-    data augmentation (e.g. RandomHorizontalFlip) is re-applied each epoch,
-    matching the augmentation behaviour of new-task data.
+    data augmentation (e.g. RandomHorizontalFlip) is re-applied each epoch
+    when ``online_exemplar_augmentation`` is True. Otherwise, exemplars are
+    transformed once at dataset construction time and replayed as fixed tensors.
 
     When ``oversample_exemplars`` is True the exemplar list is repeated so that
     old-class samples appear roughly as often as new-class samples, mitigating
@@ -151,16 +156,27 @@ class MixedDataset(Dataset):
     def __init__(self, new_data: ClassSubset,
                  exemplar_data: List[Tuple],
                  exemplar_transform=None,
+                 online_exemplar_augmentation: bool = True,
                  oversample_exemplars: bool = False):
         self.new_data = new_data
         self.exemplar_transform = exemplar_transform
+        self.online_exemplar_augmentation = online_exemplar_augmentation
 
-        if oversample_exemplars and len(exemplar_data) > 0:
-            # Repeat exemplars so total ≈ len(new_data)
-            repeats = max(1, len(new_data) // len(exemplar_data))
-            self.exemplar_data = exemplar_data * repeats
+        if online_exemplar_augmentation:
+            processed_exemplars = exemplar_data
         else:
-            self.exemplar_data = exemplar_data
+            processed_exemplars = []
+            for img, label in exemplar_data:
+                transformed = exemplar_transform(img) if exemplar_transform is not None else img
+                processed_exemplars.append((transformed, label))
+            self.exemplar_transform = None
+
+        if oversample_exemplars and len(processed_exemplars) > 0:
+            # Repeat exemplars so total ≈ len(new_data)
+            repeats = max(1, len(new_data) // len(processed_exemplars))
+            self.exemplar_data = processed_exemplars * repeats
+        else:
+            self.exemplar_data = processed_exemplars
 
     def __len__(self) -> int:
         return len(self.new_data) + len(self.exemplar_data)

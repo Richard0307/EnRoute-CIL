@@ -1,14 +1,4 @@
-"""
-CIL Trainer: Core training loop with KD, Energy OOD, MoE, and Orthogonal Projection.
-
-Implements the ERO-MoE-CIL pipeline from blueprint:
-    1. Train on new classes + exemplar replay
-    2. Loss = CE + λ * KD + MoE balance loss
-    3. Orthogonal gradient projection (optional)
-    4. Energy-based OOD evaluation (optional)
-    5. Herding exemplar selection after each task
-    6. Evaluate and record AA / AF / OOD metrics
-"""
+"""CIL Trainer: core training loop for ERO-MoE-CIL pipeline."""
 
 from dataclasses import asdict
 from pathlib import Path
@@ -46,73 +36,45 @@ from utils.orthogonal_projection import OrthogonalProjector
 
 
 class CILTrainer:
-    """
-    Orchestrates the full ERO-MoE-CIL pipeline.
-
-    Supports ablation toggles via Config flags:
-        - use_moe:        MoE adapters vs single adapter
-        - use_energy_ood: Energy-based OOD detection
-        - use_ortho_proj: Orthogonal gradient projection
-    """
+    """Orchestrates the full ERO-MoE-CIL pipeline."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
 
-        # Will be initialized in run()
         self.model: Optional[CILModel] = None
         self.old_model: Optional[CILModel] = None
-
-        # Exemplar memory: class_id → List[(image_tensor, label)]
         self.exemplar_sets: dict = {}
-        # DER++ logit memory: class_id → List[logit_tensor]  (parallel to exemplar_sets)
         self.exemplar_logits: dict = {}
-
-        # Accuracy matrix for metrics: acc_matrix[t][i] = acc on task i after task t
         self.acc_matrix: Optional[np.ndarray] = None
-
-        # All classes seen so far
         self.seen_classes: List[int] = []
-
-        # Label mapping: original CIFAR-100 class ID → contiguous index
         self.label_map: dict = {}
 
-        # Orthogonal projector (Module D extension)
         self.projector: Optional[OrthogonalProjector] = None
         if cfg.use_ortho_proj:
             self.projector = OrthogonalProjector(max_rank=cfg.ortho_max_rank)
 
-        # OOD metrics log: list of dicts per task
         self.ood_metrics_log: List[Dict[str, float]] = []
-        # Energy threshold per task
         self.energy_thresholds: List[float] = []
 
-        # Runtime metrics (saved after training for plotting)
         self.task_old_task_accuracy: List[float] = []
         self.task_max_memory_mb: List[float] = []
         self.task_avg_epoch_time_sec: List[float] = []
         self.task_avg_batch_latency_ms: List[float] = []
         self.epoch_records: List[Dict[str, float]] = []
 
-        # Best checkpoint tracking (by stage-wise AA)
         self.best_aa: float = float("-inf")
         self.best_task_id: int = -1
 
-        # TensorBoard writer
         tb_dir = Path(cfg.output_dir) / "tensorboard"
         tb_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=str(tb_dir))
         print(f"TensorBoard log dir: {tb_dir}")
 
-        # Global step counter for per-epoch logging
         self._global_step: int = 0
-        # Global step counter for per-batch logging
         self._global_batch_step: int = 0
-        # Write TensorBoard batch scalars every N batches
         self._tb_batch_log_interval: int = 10
-
-    # ── Training Loop for One Task ─────────────────────────────────────────
 
     def _train_one_task(
         self,
@@ -120,19 +82,16 @@ class CILTrainer:
         task_id: int,
         num_old_classes: int,
     ) -> Dict[str, List[float]]:
-        """Train the model for one incremental task and return runtime stats."""
+        """Train the model for one incremental task."""
         self.model.train()
 
-        # Snapshot params for orthogonal projection
         if self.projector is not None and task_id > 0:
             self.projector.snapshot_params(self.model)
 
-        # Optimizer: only adapter/MoE + classifier params
         trainable_params = self.model.get_trainable_params()
         optimizer = AdamW(trainable_params, lr=self.cfg.lr_adapter,
                           weight_decay=self.cfg.weight_decay)
 
-        # Scheduler: warmup + cosine annealing
         warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0,
                           total_iters=self.cfg.warmup_epochs)
         cosine = CosineAnnealingLR(optimizer,
@@ -146,7 +105,6 @@ class CILTrainer:
         epoch_peak_memory_mb: List[float] = []
         num_batches = max(1, len(train_loader))
 
-        # DER++: build separate replay loader with stored logits
         der_loader = None
         der_iter = None
         if self.cfg.der_alpha > 0 and task_id > 0:
@@ -160,7 +118,6 @@ class CILTrainer:
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
 
-            # Reset DER++ iterator each epoch
             if der_loader is not None:
                 der_iter = iter(der_loader)
 
@@ -171,10 +128,8 @@ class CILTrainer:
 
                 logits = self.model(images)
 
-                # ── Cross-Entropy Loss ──
                 loss_ce = ce_criterion(logits, labels)
 
-                # ── Knowledge Distillation Loss (Module D) ──
                 loss_kd = torch.tensor(0.0, device=self.device)
                 if self.old_model is not None and num_old_classes > 0:
                     with torch.no_grad():
@@ -187,12 +142,10 @@ class CILTrainer:
                         reduction="batchmean",
                     ) * (T * T)
 
-                # ── MoE Balance Loss (Module C) ──
                 loss_balance = torch.tensor(0.0, device=self.device)
                 if self.cfg.use_moe:
                     loss_balance = self.model.get_moe_balance_loss().to(self.device)
 
-                # ── DER++ Replay Loss ──
                 loss_der = torch.tensor(0.0, device=self.device)
                 if der_iter is not None:
                     try:
@@ -203,22 +156,18 @@ class CILTrainer:
                     der_imgs = der_imgs.to(self.device)
                     der_stored = der_stored.to(self.device)
                     der_current = self.model(der_imgs)
-                    # MSE on overlapping logit dimensions (stored may have fewer classes)
                     n_stored = der_stored.shape[1]
                     loss_der = F.mse_loss(der_current[:, :n_stored], der_stored)
 
-                # ── Total Loss ──
                 loss = (loss_ce + self.cfg.kd_lambda * loss_kd
                         + loss_balance + self.cfg.der_alpha * loss_der)
 
                 optimizer.zero_grad()
                 loss.backward()
 
-                # ── Orthogonal Projection (Module D extension) ──
                 if self.projector is not None and self.projector.has_basis():
                     self.projector.project_gradients(self.model)
 
-                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(trainable_params,
                                                self.cfg.grad_clip_norm)
                 optimizer.step()
@@ -233,7 +182,6 @@ class CILTrainer:
                     acc=f"{100.*correct/total:.1f}%",
                 )
 
-                # ── TensorBoard: per-batch scalars (for live monitoring) ──
                 self._global_batch_step += 1
                 if (
                     batch_idx % self._tb_batch_log_interval == 0
@@ -272,7 +220,6 @@ class CILTrainer:
             epoch_loss = total_loss / total
             epoch_acc = 100.0 * correct / total
 
-            # ── TensorBoard: per-epoch scalars ──
             self._global_step += 1
             self.writer.add_scalar("Epoch/Training_Loss", epoch_loss, self._global_step)
             self.writer.add_scalar("Epoch/Training_Accuracy", epoch_acc, self._global_step)
@@ -293,7 +240,6 @@ class CILTrainer:
                 f"peak_mem={peak_mem_mb:.1f}MB"
             )
 
-        # Update orthogonal basis after training
         if self.projector is not None and task_id > 0:
             self.projector.update_bases(self.model)
             stats = self.projector.get_stats()
@@ -306,11 +252,9 @@ class CILTrainer:
             "epoch_peak_memory_mb": epoch_peak_memory_mb,
         }
 
-    # ── Weight Aligning (WA) ─────────────────────────────────────────────
-
     @torch.no_grad()
     def _wa_compute_gamma(self, num_old_classes: int) -> float:
-        """Compute WA scaling factor γ = mean_norm_new / mean_norm_old."""
+        """Compute WA scaling factor: γ = mean_norm_new / mean_norm_old."""
         fc = self.model.classifier.fc
         norm_per_class = fc.weight.data.norm(dim=1)
         old_mean = norm_per_class[:num_old_classes].mean().item()
@@ -323,19 +267,15 @@ class CILTrainer:
 
     @torch.no_grad()
     def _wa_apply(self, num_old_classes: int, gamma: float) -> None:
-        """Temporarily scale old-class classifier weights by γ."""
         fc = self.model.classifier.fc
         fc.weight.data[:num_old_classes] *= gamma
         fc.bias.data[:num_old_classes] *= gamma
 
     @torch.no_grad()
     def _wa_revert(self, num_old_classes: int, gamma: float) -> None:
-        """Revert WA scaling to restore original training weights."""
         fc = self.model.classifier.fc
         fc.weight.data[:num_old_classes] /= gamma
         fc.bias.data[:num_old_classes] /= gamma
-
-    # ── Evaluation ─────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def _evaluate_task(
@@ -343,7 +283,6 @@ class CILTrainer:
         test_dataset,
         class_ids: List[int],
     ) -> float:
-        """Evaluate accuracy on a specific set of classes."""
         self.model.eval()
         test_subset = ClassSubset(test_dataset, class_ids, transform=TEST_TRANSFORM,
                                   label_map=self.label_map)
@@ -362,8 +301,6 @@ class CILTrainer:
 
         return correct / total if total > 0 else 0.0
 
-    # ── Energy OOD Evaluation (Module B) ──────────────────────────────────
-
     def _evaluate_ood(
         self,
         test_dataset,
@@ -371,28 +308,21 @@ class CILTrainer:
         unseen_class_ids: List[int],
         task_id: int,
     ) -> Dict[str, float]:
-        """
-        Evaluate OOD detection using energy scores.
-
-        Uses seen classes as ID and unseen classes as OOD.
-        """
+        """Evaluate OOD detection: seen classes as ID, unseen as OOD."""
         self.model.eval()
 
-        # Build ID loader (seen classes)
         id_subset = ClassSubset(test_dataset, seen_class_ids,
                                 transform=TEST_TRANSFORM, label_map=self.label_map)
         id_loader = DataLoader(id_subset, batch_size=self.cfg.batch_size,
                                shuffle=False, num_workers=self.cfg.num_workers,
                                pin_memory=True)
 
-        # Build OOD loader (unseen classes)
         ood_subset = ClassSubset(test_dataset, unseen_class_ids,
                                  transform=TEST_TRANSFORM, label_map=None)
         ood_loader = DataLoader(ood_subset, batch_size=self.cfg.batch_size,
                                 shuffle=False, num_workers=self.cfg.num_workers,
                                 pin_memory=True)
 
-        # Collect energy scores
         id_scores = collect_energy_scores(
             self.model, id_loader,
             temperature=self.cfg.energy_temperature,
@@ -404,11 +334,9 @@ class CILTrainer:
             device=str(self.device),
         )
 
-        # Calibrate threshold
         tau = calibrate_threshold(id_scores, percentile=self.cfg.ood_percentile)
         self.energy_thresholds.append(tau)
 
-        # Evaluate OOD detection
         ood_results = evaluate_ood(id_scores, ood_scores)
         ood_results["threshold"] = tau
         ood_results["task_id"] = task_id
@@ -417,14 +345,12 @@ class CILTrainer:
 
         return ood_results
 
-    # ── Exemplar Management ────────────────────────────────────────────────
-
     def _update_exemplars(
         self,
         train_dataset,
         new_class_ids: List[int],
     ) -> None:
-        """Select exemplars for new classes via herding, and store DER++ logits."""
+        """Select exemplars via herding and store DER++ logits."""
         print("  Updating exemplar memory via herding...")
         train_subset = ClassSubset(train_dataset, new_class_ids,
                                    transform=TRAIN_TRANSFORM,
@@ -442,16 +368,12 @@ class CILTrainer:
             self.exemplar_sets[class_id] = selected
             print(f"    Class {class_id}: {len(selected)} exemplars selected")
 
-        # DER++: store current model's logits for all exemplars
         if self.cfg.der_alpha > 0:
             self._store_exemplar_logits()
 
     @torch.no_grad()
     def _store_exemplar_logits(self) -> None:
-        """Run current model on all exemplars and cache logit vectors (DER++).
-
-        Uses TEST_TRANSFORM (deterministic) so stored logits are consistent.
-        """
+        """Cache current model logits for all exemplars (DER++)."""
         self.model.eval()
         self.exemplar_logits = {}
         for class_id, samples in self.exemplar_sets.items():
@@ -464,11 +386,7 @@ class CILTrainer:
         self.model.train()
 
     def _build_der_replay_loader(self) -> Optional[DataLoader]:
-        """Build a DataLoader of (image, label, stored_logits) for DER++ replay.
-
-        Images are pre-transformed with TEST_TRANSFORM (deterministic) so they
-        match the conditions under which stored logits were computed.
-        """
+        """Build a DataLoader of (image, label, stored_logits) for DER++ replay."""
         if not self.exemplar_logits:
             return None
         images, labels, logits = [], [], []
@@ -487,14 +405,12 @@ class CILTrainer:
                           shuffle=True, drop_last=False)
 
     def _get_all_exemplars(self) -> List[Tuple]:
-        """Flatten all exemplar sets into a single list."""
         all_exemplars = []
         for class_id in sorted(self.exemplar_sets.keys()):
             all_exemplars.extend(self.exemplar_sets[class_id])
         return all_exemplars
 
     def _save_runtime_metrics(self, output_dir: Path) -> Path:
-        """Persist runtime metrics used for post-training plotting."""
         metrics_path = output_dir / "training_metrics.npz"
 
         task_ids = np.arange(len(self.task_old_task_accuracy), dtype=int)
@@ -522,7 +438,6 @@ class CILTrainer:
             epoch_peak_memory_mb=epoch_peak_memory_mb,
         )
 
-        # Save OOD metrics if available
         if self.ood_metrics_log:
             ood_auroc = np.array([m.get("auroc", 0.0) for m in self.ood_metrics_log])
             ood_fpr = np.array([m.get("fpr_at_95tpr", 1.0) for m in self.ood_metrics_log])
@@ -557,15 +472,12 @@ class CILTrainer:
 
         return metrics_path
 
-    # ── Checkpoint / Resume ────────────────────────────────────────────────
-
     def _get_checkpoint_dir(self) -> Path:
         if self.cfg.checkpoint_dir:
             return Path(self.cfg.checkpoint_dir)
         return Path(self.cfg.output_dir) / "checkpoints"
 
     def resolve_resume_path(self, resume_path: str = "") -> Path:
-        """Resolve an explicit checkpoint path or pick the latest checkpoint."""
         if resume_path:
             candidate = Path(resume_path)
             if candidate.exists():
@@ -587,7 +499,6 @@ class CILTrainer:
         )
 
     def _serialize_exemplar_sets(self) -> Dict[int, List[Tuple[torch.Tensor, int]]]:
-        """Convert exemplar PIL images to tensors for checkpoint storage."""
         from torchvision.transforms.functional import to_tensor
         serialized = {}
         for class_id, samples in self.exemplar_sets.items():
@@ -603,7 +514,6 @@ class CILTrainer:
         return serialized
 
     def _deserialize_exemplar_sets(self, payload: Dict) -> Dict[int, List[Tuple]]:
-        """Restore exemplar tensors back to PIL images for on-the-fly augmentation."""
         from torchvision.transforms.functional import to_pil_image
         restored = {}
         for class_id, samples in payload.items():
@@ -618,7 +528,6 @@ class CILTrainer:
         return restored
 
     def _serialize_projector_bases(self) -> Dict[str, torch.Tensor]:
-        """Serialize orthogonal projector bases (if enabled)."""
         if self.projector is None:
             return {}
         return {
@@ -627,7 +536,6 @@ class CILTrainer:
         }
 
     def _infer_num_experts_from_state(self, model_state: Dict[str, torch.Tensor]) -> int:
-        """Infer MoE expert count from checkpoint state dict."""
         for key, tensor in model_state.items():
             if key.endswith("moe_adapter.router.gate.weight"):
                 return int(tensor.shape[0])
@@ -641,7 +549,6 @@ class CILTrainer:
         update_latest: bool = True,
         is_best: bool = False,
     ) -> Path:
-        """Save a training checkpoint."""
         if self.model is None:
             raise RuntimeError("Cannot save checkpoint: model is not initialized.")
         if self.acc_matrix is None:
@@ -708,7 +615,6 @@ class CILTrainer:
         return checkpoint_path
 
     def _load_checkpoint(self, checkpoint_path: Path, task_classes: List[List[int]]) -> int:
-        """Load checkpoint and return the next task index to run."""
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         except TypeError:
@@ -775,7 +681,6 @@ class CILTrainer:
         self.label_map = {int(k): int(v) for k, v in checkpoint.get("label_map", {}).items()}
         self.exemplar_sets = self._deserialize_exemplar_sets(checkpoint.get("exemplar_sets", {}))
 
-        # Restore DER++ logits
         saved_logits = checkpoint.get("exemplar_logits", {})
         self.exemplar_logits = {
             int(k): v.cpu() if torch.is_tensor(v) else torch.as_tensor(v)
@@ -839,8 +744,6 @@ class CILTrainer:
         )
         return next_task_id
 
-    # ── Main Pipeline ──────────────────────────────────────────────────────
-
     def run(
         self,
         task_classes: List[List[int]],
@@ -848,17 +751,7 @@ class CILTrainer:
         test_dataset,
         resume_checkpoint: Optional[Path] = None,
     ) -> np.ndarray:
-        """
-        Run the full CIL pipeline across all tasks.
-
-        Args:
-            task_classes: List of class ID lists, one per incremental task.
-            train_dataset: Raw CIFAR-100 train dataset.
-            test_dataset:  Raw CIFAR-100 test dataset.
-
-        Returns:
-            acc_matrix: (T, T) accuracy matrix.
-        """
+        """Run the full CIL pipeline across all tasks."""
         T = len(task_classes)
         if resume_checkpoint is not None:
             start_task_id = self._load_checkpoint(Path(resume_checkpoint), task_classes)
@@ -886,12 +779,10 @@ class CILTrainer:
         if start_task_id >= T:
             print("Checkpoint already contains all tasks. Skipping training loop.")
 
-        # Flatten all class IDs for OOD evaluation
         all_class_ids = []
         for classes in task_classes:
             all_class_ids.extend(classes)
 
-        # Print enabled modules
         modules = ["Adapter+KD (baseline)"]
         if self.cfg.use_moe:
             modules.append(f"MoE ({self.cfg.num_experts} experts, top-{self.cfg.top_k})")
@@ -913,12 +804,10 @@ class CILTrainer:
 
             num_old_classes = len(self.seen_classes)
 
-            # ── Build label map: original class ID → contiguous index ──
             for cls_id in new_classes:
                 if cls_id not in self.label_map:
                     self.label_map[cls_id] = len(self.label_map)
 
-            # ── Step 1: Initialize or expand model ──
             if self.model is None and len(self.seen_classes) == 0:
                 self.model = CILModel(
                     backbone_name=self.cfg.backbone,
@@ -931,23 +820,21 @@ class CILTrainer:
                     top_k=self.cfg.top_k,
                 ).to(self.device)
 
-                # Print model info
                 total_params = sum(p.numel() for p in self.model.parameters())
                 trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
                 print(f"  Total params: {total_params:,} | Trainable: {trainable:,} ({100*trainable/total_params:.1f}%)")
             else:
                 if self.model is None:
                     raise RuntimeError("Model state is missing before incremental expansion.")
-                # Save old model for KD
                 self.old_model = self.model.freeze_copy()
-                # Expand classifier for new classes
-                self.model.expand_classes(len(new_classes))
-                # Add new MoE experts for the new task
+                self.model.expand_classes(
+                    len(new_classes),
+                    scale_matched_head_init=self.cfg.scale_matched_head_init,
+                )
                 if self.cfg.use_moe and self.cfg.add_expert_per_task:
                     self.model.add_moe_experts(num_new=1)
                     print(f"  Added 1 new expert per MoE layer")
 
-            # ── Step 2: Build training data (new classes + exemplars) ──
             exemplars = self._get_all_exemplars() if task_id > 0 else None
             train_loader, _ = get_task_dataloaders(
                 train_dataset, test_dataset, new_classes,
@@ -955,10 +842,10 @@ class CILTrainer:
                 num_workers=self.cfg.num_workers,
                 exemplar_data=exemplars,
                 label_map=self.label_map,
+                online_exemplar_augmentation=self.cfg.online_exemplar_augmentation,
                 oversample_exemplars=self.cfg.oversample_exemplars,
             )
 
-            # ── Step 3: Train ──
             train_stats = self._train_one_task(train_loader, task_id, num_old_classes)
             peak_mem = max(train_stats["epoch_peak_memory_mb"]) if train_stats["epoch_peak_memory_mb"] else 0.0
             avg_epoch_time = (
@@ -973,18 +860,13 @@ class CILTrainer:
             self.task_avg_epoch_time_sec.append(avg_epoch_time)
             self.task_avg_batch_latency_ms.append(avg_latency)
 
-            # ── Step 3.5: Compute WA γ (evaluate-only, not applied to weights yet) ──
             wa_gamma = 1.0
             if self.cfg.use_wa and num_old_classes > 0:
                 wa_gamma = self._wa_compute_gamma(num_old_classes)
 
-            # ── Step 4: Update seen classes ──
             self.seen_classes.extend(new_classes)
-
-            # ── Step 5: Update exemplars (on ORIGINAL weights, before WA) ──
             self._update_exemplars(train_dataset, new_classes)
 
-            # ── Step 6: Evaluate with WA applied temporarily ──
             if wa_gamma != 1.0:
                 self._wa_apply(num_old_classes, wa_gamma)
 
@@ -1004,7 +886,6 @@ class CILTrainer:
             else:
                 print("  Old-task accuracy (mean): N/A (base task)")
 
-            # ── Step 7: Energy OOD evaluation (Module B) ──
             if self.cfg.use_energy_ood and task_id < T - 1:
                 unseen_ids = []
                 for future_task in task_classes[task_id + 1:]:
@@ -1026,11 +907,9 @@ class CILTrainer:
                     print(f"    ID energy (mean): {ood_results['id_mean_energy']:.4f} | "
                           f"OOD energy (mean): {ood_results['ood_mean_energy']:.4f}")
 
-            # ── Step 8: Print metrics & TensorBoard per-task logging ──
             print_metrics(self.acc_matrix, task_id)
 
             current_aa = float(np.mean(self.acc_matrix[task_id, :task_id + 1]))
-            # Per-task TensorBoard logging
             for past_id in range(task_id + 1):
                 self.writer.add_scalar(
                     f"Per_Task_Accuracy/Task_{past_id}",
@@ -1066,18 +945,15 @@ class CILTrainer:
                     is_best=True,
                 )
 
-            # ── Revert WA so next task trains on original weights ──
             if wa_gamma != 1.0:
                 self._wa_revert(num_old_classes, wa_gamma)
 
-        # ── Save final metrics ──
         output_dir = Path(self.cfg.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         np.save(output_dir / "acc_matrix.npy", self.acc_matrix)
         self._save_runtime_metrics(output_dir)
         print(f"\nAccuracy matrix saved to {output_dir / 'acc_matrix.npy'}")
 
-        # Close TensorBoard writer
         self.writer.close()
 
         return self.acc_matrix

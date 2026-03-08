@@ -1,76 +1,75 @@
-"""
-Configuration for Open-World CIL experiments.
-"""
+"""Configuration for CIL experiments."""
 
 from dataclasses import dataclass
 
 
 @dataclass
 class Config:
-    # ── Dataset ──
+    # Dataset
     dataset: str = "cifar100"
     data_root: str = "./data/raw"
     num_workers: int = 4
 
-    # ── Incremental Schedule ──
-    # Base phase has `init_classes` classes; each subsequent phase adds `inc_classes`.
+    # Incremental schedule
     init_classes: int = 50
     inc_classes: int = 10
 
-    # ── Model ──
+    # Model
     backbone: str = "vit_base_patch16_224"
     pretrained: bool = True
-    feature_dim: int = 768          # ViT-B output dimension
-    adapter_bottleneck: int = 64    # Adapter down-projection dimension
+    feature_dim: int = 768
+    adapter_bottleneck: int = 64
 
-    # ── Memory ──
-    exemplars_per_class: int = 20   # K in herding selection
-    oversample_exemplars: bool = True  # Oversample exemplars to balance with new-class data
+    # Memory
+    exemplars_per_class: int = 20
+    online_exemplar_augmentation: bool = True
+    oversample_exemplars: bool = True
 
-    # ── Training ──
+    # Training
     epochs: int = 20
     batch_size: int = 64
-    lr_adapter: float = 1e-3        # LR for adapters & classifier head
-    lr_backbone_top: float = 1e-5   # LR for unfrozen top blocks (if any)
+    lr_adapter: float = 1e-3
+    lr_backbone_top: float = 1e-5
     weight_decay: float = 5e-4
     warmup_epochs: int = 3
     grad_clip_norm: float = 1.0
 
-    # ── Knowledge Distillation ──
-    kd_lambda: float = 1.0          # λ weight for distillation loss
-    kd_temperature: float = 2.0     # T for soft-label distillation
+    # Knowledge distillation
+    kd_lambda: float = 1.0
+    kd_temperature: float = 2.0
 
-    # ── MoE (Module C) ──
-    use_moe: bool = False           # Enable MoE adapters instead of single adapter
-    num_experts: int = 2            # Initial number of experts per MoE layer
-    top_k: int = 1                  # Number of experts activated per sample
-    add_expert_per_task: bool = True # Add a new expert when learning each new task
+    # MoE
+    use_moe: bool = False
+    num_experts: int = 2
+    top_k: int = 1
+    add_expert_per_task: bool = True
 
-    # ── Energy OOD (Module B) ──
-    use_energy_ood: bool = False    # Enable energy-based OOD detection
-    energy_temperature: float = 1.0 # Temperature for energy score computation
-    ood_percentile: float = 95.0    # Percentile for threshold calibration
+    # Energy OOD
+    use_energy_ood: bool = False
+    energy_temperature: float = 1.0
+    ood_percentile: float = 95.0
 
-    # ── Orthogonal Projection (Module D extension) ──
-    use_ortho_proj: bool = False    # Enable orthogonal gradient projection
-    ortho_max_rank: int = 20        # Max rank of historical subspace per param
+    # Orthogonal projection
+    use_ortho_proj: bool = False
+    ortho_max_rank: int = 20
 
-    # ── DER++ (Dark Experience Replay++) ──
-    der_alpha: float = 0.1          # MSE loss coefficient for stored-logit replay
+    # DER++
+    der_alpha: float = 0.1
 
-    # ── Weight Aligning (WA) ──
-    use_wa: bool = True             # Align old/new classifier weight norms after each task
+    # Weight Aligning
+    use_wa: bool = True
+    scale_matched_head_init: bool = True
 
-    # ── Device ──
+    # Device
     device: str = "cuda"
 
-    # ── Logging ──
+    # Logging
     output_dir: str = "./output"
     seed: int = 42
 
-    # ── Checkpoint / Resume ──
-    checkpoint_dir: str = ""         # Empty => <output_dir>/checkpoints
-    auto_checkpoint: bool = True     # Save one checkpoint after each finished task
-    save_best: bool = False          # Save extra best checkpoint by AA
-    resume: bool = False             # Resume from checkpoint
-    resume_path: str = ""            # Explicit checkpoint path; empty => latest
+    # Checkpoint / Resume
+    checkpoint_dir: str = ""
+    auto_checkpoint: bool = True
+    save_best: bool = False
+    resume: bool = False
+    resume_path: str = ""
