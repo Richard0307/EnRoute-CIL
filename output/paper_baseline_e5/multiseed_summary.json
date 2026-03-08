@@ -1,0 +1,59 @@
+{
+  "per_seed": [
+    {
+      "seed": 42,
+      "seed_dir": "output/paper_baseline_e5/seed_42",
+      "aa": 0.8662666666666667,
+      "af": 0.12835999999999997,
+      "final_old_task_accuracy": 0.84412,
+      "max_memory_mb": 3282.73828125,
+      "mean_epoch_time_sec": 87.69083957443654,
+      "mean_batch_latency_ms": 330.49943578763606
+    },
+    {
+      "seed": 43,
+      "seed_dir": "output/paper_baseline_e5/seed_43",
+      "aa": 0.8540333333333333,
+      "af": 0.13179999999999997,
+      "final_old_task_accuracy": 0.8302400000000001,
+      "max_memory_mb": 3282.73828125,
+      "mean_epoch_time_sec": 164.24357787926758,
+      "mean_batch_latency_ms": 620.83480284208
+    },
+    {
+      "seed": 44,
+      "seed_dir": "output/paper_baseline_e5/seed_44",
+      "aa": 0.8327666666666667,
+      "af": 0.16671999999999998,
+      "final_old_task_accuracy": 0.80192,
+      "max_memory_mb": 3282.73828125,
+      "mean_epoch_time_sec": 182.37174690589987,
+      "mean_batch_latency_ms": 689.2383308927546
+    }
+  ],
+  "aggregate": {
+    "num_seeds": 3,
+    "aa_mean": 0.8510222222222222,
+    "aa_std": 0.013841064327875798,
+    "af_mean": 0.1422933333333333,
+    "af_std": 0.017329261060093963,
+    "mean_acc_matrix_path": "output/paper_baseline_e5/mean_acc_matrix.npy",
+    "std_acc_matrix_path": "output/paper_baseline_e5/std_acc_matrix.npy",
+    "final_old_task_accuracy_mean": 0.8254266666666666,
+    "final_old_task_accuracy_std": 0.01756105792814192,
+    "max_memory_mb_mean": 3282.73828125,
+    "max_memory_mb_std": 0.0,
+    "mean_epoch_time_sec_mean": 144.76872145320132,
+    "mean_epoch_time_sec_std": 41.03308484535544,
+    "mean_batch_latency_ms_mean": 546.8575231741569,
+    "mean_batch_latency_ms_std": 155.51608093829586,
+    "plot_paths": {
+      "task_accuracy_curves": "output/paper_baseline_e5/task_accuracy_curves.png",
+      "aa_af_progression": "output/paper_baseline_e5/aa_af_progression.png",
+      "accuracy_heatmap": "output/paper_baseline_e5/accuracy_heatmap.png",
+      "max_memory_allocated": "output/paper_baseline_e5/max_memory_allocated.png",
+      "accuracy_on_old_tasks": "output/paper_baseline_e5/accuracy_on_old_tasks.png",
+      "time_per_epoch_latency": "output/paper_baseline_e5/time_per_epoch_latency.png"
+    }
+  }
+}
