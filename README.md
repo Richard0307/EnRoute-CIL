@@ -1,88 +1,185 @@
-# ERO-MoE-CIL: Privacy-Preserving Open-World Continual Learning for Intelligent Cockpit
+# EnRoute-CIL: Energy-Guided Routed Continual Learning for Intelligent Cockpit Personalization
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![DOI](https://zenodo.org/badge/1167839322.svg)](https://doi.org/10.5281/zenodo.18873097)
 
-Research codebase for **ERO-MoE-CIL**, a frozen-ViT continual learning framework for intelligent cockpit personalization. The current project focus is **open-world continual adaptation with energy-guided expert expansion** under a parameter-efficient setting.
+Research repository for **EnRoute-CIL**, a frozen-ViT continual learning framework for intelligent cockpit personalization. The current codebase focuses on **open-world continual adaptation** under strict compute budgets, with a practical design centered on **energy-guided expert routing** and **smooth routing regularization**.
+
+Previous internal manuscript drafts may still use the earlier name **ERO-MoE-CIL**. In this repository, **EnRoute-CIL** is the current project name.
 
 ## Abstract
 
-In real-world autonomous systems (e.g., intelligent cockpits), AI models inevitably encounter out-of-distribution (OOD) behaviors after deployment. Traditional Parameter-Efficient Class-Incremental Learning (PEFT-CIL) methods rely on human-provided task boundaries and struggle to adapt autonomously. 
+Deployed intelligent-cockpit systems must adapt to newly emerging driver behaviors without uploading private in-cabin data, retraining the full backbone, or catastrophically forgetting previously learned habits. EnRoute-CIL addresses this setting with a **frozen ViT backbone**, **adapter-based parameter-efficient updates**, **Mixture-of-Experts (MoE) growth**, and an **offline energy-guided routing mechanism**.
 
-Our framework introduces an **offline, energy-guided dynamic expert activation mechanism**. When an unknown behavior triggers the energy threshold, the system autonomously wakes up a dormant MoE expert. To prevent the newly added expert from overfitting to limited newly discovered samples, we design a **Smooth Routing Regularization ($\mathcal{L}_{skew}$)** that mathematically guides the MoE gate distribution, ensuring a seamless transition between old and new knowledge.
+The key design choice is to treat high-energy observations not as a driver-facing annotation event, but as an **offline trigger for controlled expert activation**. A dormant expert is awakened only after sufficient OOD evidence has accumulated. To prevent the newly activated expert from dominating the router under limited new-class evidence, the framework introduces a **smooth routing regularizer** (`L_skew`) that biases the gate distribution gradually rather than through hard expert switching.
 
-## Core Idea
+Under a unified 3-seed, 5-epoch benchmark on **Split CIFAR-100** and **State Farm Distracted Driver Detection**, EnRoute-CIL provides a strong system-level trade-off between accuracy and forgetting while remaining highly parameter-efficient.
 
-The repository is centered on four coupled components:
+## Research Positioning
 
-- **Frozen ViT backbone**: keep the pre-trained backbone fixed and update only lightweight adaptation modules.
-- **MoE adapters with dynamic growth**: expand expert capacity incrementally instead of full-model fine-tuning.
-- **Energy-based OOD detection**: use classifier energy to detect behavior patterns outside the current in-distribution set.
-- **Offline OOD-triggered expert routing**: cache high-energy samples offline, then bias routing toward a dormant expert with a smooth regularizer once enough OOD evidence has accumulated.
+This project belongs primarily to **continual learning / machine learning**, with an application focus on **intelligent cockpit personalization** in a broader human-centered AI setting.
 
-This keeps the method aligned with intelligent-cockpit constraints:
-- no real-time driver-facing annotation loop;
-- no unconditional expert explosion;
-- no dependence on a fixed hand-tuned OOD threshold without calibration.
+More specifically, the repository studies:
 
-## Framework Figure
+- **class-incremental learning** under a frozen pre-trained vision backbone;
+- **parameter-efficient adaptation** through adapters and MoE modules;
+- **open-world behavior adaptation** via energy-based uncertainty signals;
+- **edge-oriented deployment trade-offs**, where adaptation must remain lightweight and privacy-conscious.
+
+## Method Overview
+
+EnRoute-CIL combines four core components:
+
+1. **Frozen ViT backbone**
+   - The pre-trained transformer backbone remains fixed.
+   - Only lightweight adaptation modules are updated.
+
+2. **Adapter / MoE-based continual adaptation**
+   - Standard adapter baseline for strong parameter-efficient rehearsal.
+   - Optional dynamic MoE growth for additional task-specific capacity.
+
+3. **Energy-based OOD scoring**
+   - High-energy samples are treated as evidence that the current representation is insufficient.
+   - OOD detection is used in an **offline** adaptation loop rather than a real-time in-drive interaction loop.
+
+4. **Energy-guided smooth routing (`L_skew`)**
+   - When enough OOD evidence accumulates, routing is gradually biased toward a dormant expert.
+   - This is intended to reduce modal overlap and prevent abrupt overfitting to newly observed behavior fragments.
+
+Framework figure:
 
 ![Framework](docs/rp_framework_paper.png)
 
-## Key Implementation Points
+## Benchmark Protocol
 
-- Exemplars are stored as raw PIL images and transformed online.
-- Replay can be oversampled to reduce new/old imbalance.
-- Classifier expansion uses scale-matched initialization.
-- Orthogonal projection uses a block-projection strategy for dynamically expanded parameters.
-- OOD-triggered expert routing is implemented as an **offline** mechanism, not as an in-drive HITL workflow.
-- Benchmark wrappers are included for `ours`, `l2p`, `coda_prompt`, and `moe_adapters` under a unified multi-seed protocol.
+The repository now contains a unified benchmark harness covering:
 
-## Repository Structure
+- **Methods**
+  - `ours`
+  - `ours_baseline`
+  - `l2p`
+  - `coda_prompt`
+  - `moe_adapters`
+
+- **Datasets**
+  - `cifar100`
+  - `statefarm`
+
+- **Seeds**
+  - `{42, 43, 44}`
+
+- **Epoch budget**
+  - `5 epochs` per task
+
+Task schedules:
+
+- **CIFAR-100**: `50 + 10 x 5`
+- **State Farm**: `5 + 1 x 5`
+
+Reported metrics:
+
+- `AA` (Average Accuracy)
+- `AF` (Average Forgetting)
+- `Final Old-Task Accuracy`
+- `Trainable Ratio`
+- `OOD AUROC / FPR@95TPR` when exported by the benchmark wrapper
+- `AA std / AF std` across 3 seeds
+
+The canonical benchmark artifacts are stored under:
 
 ```text
-Personalized-Cockpit-CIL/
-├── main.py
-├── trainer.py
-├── config.py
-├── models/
-│   ├── vit_adapter.py
-│   └── moe_adapter.py
-├── utils/
-│   ├── data_utils.py
-│   ├── herding.py
-│   ├── energy_ood.py
-│   ├── orthogonal_projection.py
-│   └── metrics.py
-├── scripts/
-│   ├── plot_results.py
-│   ├── run_multiseed.py
-│   └── run_benchmark_method.py
-├── benchmarks/
-│   └── common.py
-├── third_party/
-└── docs/
+output/benchmark_sota/
 ```
 
-## Environment
+The top-level aggregate files are:
 
-Recommended setup:
+- `output/benchmark_sota/benchmark_overview.md`
+- `output/benchmark_sota/benchmark_overview.csv`
+- `output/benchmark_sota/benchmark_overview.json`
+
+## Main Results
+
+### CIFAR-100: Cross-Paradigm Comparison
+
+Results below use the completed 3-seed benchmark artifacts in `output/benchmark_sota/cifar100/`.
+
+| Method | AA (mean ± std) | AF (mean ± std) | Final Old-Task Acc | Trainable Ratio | OOD AUROC |
+|---|---:|---:|---:|---:|---:|
+| **EnRoute-CIL (ours)** | **86.02% ± 0.78%** | 10.25% ± 0.70% | **84.55% ± 0.81%** | 1.45% | - |
+| L2P | 74.11% ± 1.50% | **1.83% ± 0.13%** | 74.99% ± 2.23% | **0.65%** | 0.8334 |
+| CODA-Prompt | 79.31% ± 1.60% | 2.17% ± 0.18% | 80.17% ± 2.16% | 4.37% | **0.8836** |
+| MoE-Adapters4CL | 79.68% ± 0.76% | 7.34% ± 0.35% | 78.87% ± 1.13% | 100.00% | 0.8333 |
+
+### CIFAR-100: Ours vs Frozen-ViT Adapter Baseline
+
+This comparison isolates the contribution of the energy-guided routing mechanism against the repository's frozen-ViT adapter baseline.
+
+| Configuration | AA (mean ± std) | AF (mean ± std) | Final Old-Task Acc |
+|---|---:|---:|---:|
+| Frozen ViT + Adapter (`ours_baseline`) | 85.10% ± 1.38% | 14.23% ± 1.73% | 82.54% ± 1.76% |
+| **EnRoute-CIL (`ours`)** | **86.02% ± 0.78%** | **10.25% ± 0.70%** | **84.55% ± 0.81%** |
+
+Observed deltas (`ours - baseline`):
+
+- `AA`: `+0.91` percentage points
+- `AF`: `-3.98` percentage points
+- Relative forgetting reduction: `27.94%`
+
+### State Farm: Cross-Paradigm Comparison
+
+Results below use the completed 3-seed benchmark artifacts in `output/benchmark_sota/statefarm/`.
+
+| Method | AA (mean ± std) | AF (mean ± std) | Final Old-Task Acc | Trainable Ratio | OOD AUROC |
+|---|---:|---:|---:|---:|---:|
+| **EnRoute-CIL (ours)** | **67.19% ± 3.11%** | 30.58% ± 5.86% | **64.22% ± 3.30%** | 1.38% | - |
+| L2P | 16.10% ± 1.68% | 2.76% ± 0.35% | 18.78% ± 2.42% | **0.57%** | 0.5537 |
+| CODA-Prompt | 15.23% ± 0.66% | **0.08% ± 0.05%** | 18.27% ± 0.79% | 4.29% | **0.6447** |
+| MoE-Adapters4CL | 29.95% ± 10.02% | 3.05% ± 3.89% | 35.88% ± 12.08% | 100.00% | 0.5523 |
+
+## Result Interpretation
+
+The current benchmark supports three empirical observations.
+
+1. **Low forgetting is not sufficient evidence of useful adaptation.**
+   - On both datasets, prompt-based baselines (`L2P`, `CODA-Prompt`) show very small `AF`.
+   - Under the strict `5-epoch` budget, this low forgetting coexists with substantially lower `AA`, suggesting a more rigid adaptation regime rather than a superior plasticity-retention trade-off.
+
+2. **Adapter-space intervention is more sample-efficient than input-prompt intervention in this repository's setting.**
+   - Under identical epoch and seed budgets, the frozen-ViT adapter route remains substantially more plastic than prompt-only baselines.
+   - This is especially visible on `State Farm`, where the low-increment (`5 + 1 x 5`) schedule strongly stresses new-class adaptation.
+
+3. **Energy-guided smooth routing improves the repository's own baseline trade-off.**
+   - Relative to the frozen-ViT adapter baseline, EnRoute-CIL gains `+0.91` AA points on CIFAR-100 while reducing forgetting by `27.94%`.
+   - This supports the interpretation that `L_skew` helps constrain overfitting pressure during expert activation, rather than simply adding more parameters.
+
+These are **setting-bounded** observations. They apply to the current protocol, implementation family, and epoch budget; they should not be generalized to all PEFT-CIL settings without further evidence.
+
+## Reproducibility
+
+### Environment
+
+Recommended environment:
 
 ```bash
 conda create -n cockpit python=3.10 -y
 conda activate cockpit
 pip install -r requirements.txt
 pip install tensorboard
+pip install -r third_party/CODA-Prompt/requirements.txt
+pip install -r third_party/MoE-Adapters4CL/cil/requirements.txt
 ```
 
-## Quick Start
+### Single-Run Training
 
-Single-run training:
+Example EnRoute-CIL run:
 
 ```bash
 python main.py --epochs 5 \
-  --use_moe --use_energy_ood --use_ood_expert_routing --use_ortho_proj \
+  --use_moe \
+  --use_energy_ood \
+  --use_ood_expert_routing \
+  --use_ortho_proj \
   --der_alpha 0.3 \
   --ood_router_lambda 0.2 \
   --ood_router_temperature 1.0 \
@@ -92,23 +189,7 @@ python main.py --epochs 5 \
   --save_best
 ```
 
-This configuration is designed for **post-trip adaptation**: the system buffers high-energy segments offline and only activates a dormant expert when trigger conditions are satisfied.
-
-## Unified Benchmark
-
-The repository now includes a unified benchmark harness for representative PTM/PEFT continual-learning baselines.
-
-Supported methods:
-- `ours`
-- `l2p`
-- `coda_prompt`
-- `moe_adapters`
-
-Supported datasets:
-- `cifar100`
-- `statefarm`
-
-One-click benchmark command:
+### Unified Multi-Seed Benchmark
 
 ```bash
 python scripts/run_multiseed.py \
@@ -124,76 +205,27 @@ python scripts/run_multiseed.py \
   --output_root output/benchmark_sota
 ```
 
-Outputs:
-- per-seed: `benchmark_summary.json`
-- per-method aggregate: `multiseed_summary.json`, `multiseed_summary.md`, `mean_acc_matrix.npy`
-- global overview: `benchmark_overview.md`, `benchmark_overview.csv`, `benchmark_overview.json`
+### Staged Cloud Script
 
-Unified metrics:
-- `AA`
-- `AF`
-- `Final Old-Task Accuracy`
-- `trainable_params / total_params / trainable_ratio`
-- `OOD AUROC / FPR@95TPR`
-- `AA std / AF std`
+The repository also includes a staged launcher:
 
-## CIFAR-100 Result Snapshot (Ours vs Baseline)
+```bash
+./training.sh
+```
 
-Using the completed 3-seed benchmark outputs under:
+`training.sh` first validates `cifar100` on `ours + l2p + coda_prompt`, then continues to `moe_adapters`, and finally runs the `statefarm` benchmark with built-in output checks.
 
-- `output/benchmark_sota/cifar100/ours/multiseed_summary.json`
-- `output/benchmark_sota/cifar100/ours_baseline/multiseed_summary.json`
-
-where `ours_baseline` keeps the frozen ViT + standard adapter pipeline, and `ours` adds the energy-guided MoE routing mechanism with smooth routing regularization (`L_skew`), the CIFAR-100 comparison is:
-
-| Configuration | AA (mean ± std) | AF (mean ± std) |
-|---|---:|---:|
-| Baseline (`ours_baseline`) | 85.10% ± 1.38% | 14.23% ± 1.73% |
-| Ours (`energy-guided MoE + L_skew`) | 86.02% ± 0.78% | 10.25% ± 0.70% |
-
-Observed deltas (Ours - Baseline):
-
-- `AA`: `+0.91` percentage points
-- `AF`: `-3.98` percentage points
-- Relative forgetting reduction: `27.94%` (`(AF_base - AF_ours) / AF_base`)
-
-This result provides direct evidence that `L_skew` is effective at reducing forgetting/overfitting pressure in this benchmark setting, while preserving a modest AA gain.
-
-## CIFAR-100 Interpretation vs Prompt and MoE Baselines
-
-Under the same 5-epoch, 3-seed benchmark protocol on CIFAR-100:
-
-| Method | AA (mean ± std) | AF (mean ± std) | Final-task Acc (mean) |
-|---|---:|---:|---:|
-| Ours (`energy-guided MoE + L_skew`) | 86.02% ± 0.78% | 10.25% ± 0.70% | 93.33% |
-| Ours Baseline (`frozen ViT + adapter`) | 85.10% ± 1.38% | 14.23% ± 1.73% | 97.90% |
-| L2P | 74.11% ± 1.50% | 1.83% ± 0.13% | 69.67% |
-| CODA-Prompt | 79.31% ± 1.60% | 2.17% ± 0.18% | 75.03% |
-| MoE-Adapters4CL | 79.68% ± 0.76% | 7.34% ± 0.35% | 83.70% |
-
-Interpretation:
-
-- Prompt-family baselines (`L2P`, `CODA-Prompt`) show very low AF, but also much lower AA and lower final-task accuracy in this strict-epoch setting, indicating higher rigidity (limited plastic adaptation to new tasks).
-- Compared with our adapter baseline, EnRoute-CIL improves system-level balance: `+0.91` AA points and `-3.98` AF points (`-27.94%` relative AF), while keeping high final-task learning capability.
-- This supports (not universally proves) the role of `L_skew` in reducing expert-space overfitting and modal overlap under constrained compute budgets.
-
-Implementation note:
-- `L2P` is benchmarked through the vendored PyTorch `L2P` implementation inside `third_party/CODA-Prompt` so that prompt-family baselines run under one unified protocol.
-- `MoE-Adapters4CL` remains a cross-paradigm comparison because it is CLIP/VLM-based.
-
-## Data Notes
+## Data Preparation
 
 ### CIFAR-100
 
-Use the existing `data/raw/` path.
-
-### State Farm
-
-Place the raw dataset under:
+The benchmark uses:
 
 ```text
-data/raw/statefarm/
+data/raw/cifar100/
 ```
+
+### State Farm
 
 Supported raw forms:
 
@@ -202,15 +234,69 @@ data/raw/statefarm/driver_imgs_list.csv + imgs/train/...
 data/raw/statefarm/state-farm-distracted-driver-detection.zip
 ```
 
-The benchmark wrapper will automatically unpack the zip form if needed and prepare:
+The wrapper will automatically prepare:
 
 ```text
 data/processed/statefarm_cl/train
 data/processed/statefarm_cl/test
 ```
 
-If `driver_imgs_list.csv` is present, the split is driver-based. Otherwise, it falls back to a class-wise random split.
+If `driver_imgs_list.csv` is available, the split is driver-aware; otherwise a class-wise random split is used.
+
+## Output Artifacts
+
+For each method and seed, the benchmark writes:
+
+- `benchmark_summary.json`
+- `acc_matrix.npy`
+- `assets/`
+
+For each method aggregate:
+
+- `multiseed_summary.json`
+- `multiseed_summary.md`
+- `mean_acc_matrix.npy`
+- `std_acc_matrix.npy`
+
+For the whole benchmark:
+
+- `benchmark_overview.md`
+- `benchmark_overview.csv`
+- `benchmark_overview.json`
+
+These files are the authoritative source for the result tables reported in this README.
+
+## Repository Layout
+
+```text
+EnRoute-CIL/
+├── main.py
+├── trainer.py
+├── config.py
+├── training.sh
+├── models/
+├── utils/
+├── scripts/
+│   ├── run_multiseed.py
+│   ├── run_benchmark_method.py
+│   └── plot_results.py
+├── benchmarks/
+│   └── common.py
+├── third_party/
+│   ├── CODA-Prompt/
+│   └── MoE-Adapters4CL/
+├── paper/
+├── output/
+└── docs/
+```
+
+## Limitations
+
+- The current benchmark uses a strict `5-epoch` budget. The resulting trade-offs emphasize rapid adaptation and may differ from longer training schedules.
+- The unified benchmark currently exports `OOD AUROC` for third-party wrappers more consistently than for the native `ours` path. Native OOD behavior is still available in method-specific training artifacts.
+- `State Farm` under `5 + 1 x 5` is intentionally stringent. Results should be interpreted as stress-test behavior under extremely low incremental supervision.
+- The repository contains vendored third-party code with compatibility patches required for the unified benchmark harness.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+This project is released under the MIT License. See [LICENSE](LICENSE) for details.
