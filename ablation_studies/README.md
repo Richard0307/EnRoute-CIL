@@ -41,10 +41,3 @@ The values above are taken directly from:
 - `output/benchmark_sota/cifar100/ours/multiseed_summary.json`
 - `output/benchmark_sota/cifar100/ours_baseline/multiseed_summary.json`
 
-## Next-Step Ablations
-
-The next ablations worth adding are:
-
-1. isolated `L_skew` on/off under the same MoE routing stack
-2. OOD-guided routing on/off while keeping the same replay pipeline
-3. visualization-backed comparison of feature-space collapse vs expert specialization
