@@ -61,10 +61,18 @@ def cosine_lr(optimizer, base_lrs, warmup_length, steps):
     if not isinstance(base_lrs, list):
         base_lrs = [base_lrs for _ in optimizer.param_groups]
     assert len(base_lrs) == len(optimizer.param_groups)
+    steps = max(int(steps), 1)
+    warmup_length = max(int(warmup_length), 0)
 
     def _lr_adjuster(step):
+        step = min(int(step), steps)
         for param_group, base_lr in zip(optimizer.param_groups, base_lrs):
-            if step < warmup_length:
+            if steps <= warmup_length:
+                if step < steps:
+                    lr = _warmup_lr(base_lr, steps, step)
+                else:
+                    lr = base_lr
+            elif step < warmup_length:
                 lr = _warmup_lr(base_lr, warmup_length, step)
             else:
                 e = step - warmup_length
@@ -205,6 +213,5 @@ def distillation(t, s, T=2):
     p = F.softmax(t / T, dim=1)
     loss = F.cross_entropy(s / T, p, reduction="mean") * (T ** 2)
     return loss
-
 
 
