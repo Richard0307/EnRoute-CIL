@@ -4,9 +4,8 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![DOI](https://zenodo.org/badge/1167839322.svg)](https://doi.org/10.5281/zenodo.18873097)
 
-Research repository for **EnRoute-CIL**, a frozen-ViT continual learning framework for intelligent cockpit personalization. The current codebase focuses on **open-world continual adaptation** under strict edge-side constraints, with a practical design centered on the **system-level synthesis** of replay, adapters, energy-based uncertainty, and smooth expert routing.
+Research repository for **EnRoute-CIL**, a frozen-ViT continual learning framework for intelligent cockpit. The current codebase focuses on **open-world continual adaptation** under strict edge-side constraints, with a practical design centered on the **system-level synthesis** of replay, adapters, energy-based uncertainty, and smooth expert routing.
 
-Previous internal manuscript drafts may still use the earlier name **ERO-MoE-CIL**. In this repository, **EnRoute-CIL** is the current project name.
 
 ## Abstract
 
@@ -18,7 +17,7 @@ Under a unified 3-seed, 5-epoch benchmark on **Split CIFAR-100** and **State Far
 
 ## Research Positioning
 
-This project belongs primarily to **continual learning / machine learning**, with an application focus on **intelligent cockpit personalization** in a broader human-centered AI setting.
+This project belongs primarily to **continual learning / machine learning**, with an application focus on **intelligent cockpit** in a broader human-centered AI setting.
 
 More specifically, the repository studies:
 
@@ -47,7 +46,6 @@ EnRoute-CIL combines four coupled components:
    - When enough OOD evidence accumulates, routing is gradually biased toward a dormant expert.
    - This is intended to reduce modal overlap and prevent abrupt overfitting to newly observed behavior fragments.
 
-The repository should therefore be read as a **systems paper codebase**: the emphasis is on how these pieces are integrated under edge-side constraints, not on claiming that any single mechanism in isolation is universally novel.
 
 Framework figure:
 
