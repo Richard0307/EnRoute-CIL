@@ -4,7 +4,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![DOI](https://zenodo.org/badge/1167839322.svg)](https://doi.org/10.5281/zenodo.18873097)
 
-Research repository for **EnRoute-CIL**, a frozen-ViT continual learning framework for intelligent cockpit personalization. The current codebase focuses on **open-world continual adaptation** under strict compute budgets, with a practical design centered on **energy-guided expert routing** and **smooth routing regularization**.
+Research repository for **EnRoute-CIL**, a frozen-ViT continual learning framework for intelligent cockpit personalization. The current codebase focuses on **open-world continual adaptation** under strict edge-side constraints, with a practical design centered on the **system-level synthesis** of replay, adapters, energy-based uncertainty, and smooth expert routing.
 
 Previous internal manuscript drafts may still use the earlier name **ERO-MoE-CIL**. In this repository, **EnRoute-CIL** is the current project name.
 
@@ -14,7 +14,7 @@ Deployed intelligent-cockpit systems must adapt to newly emerging driver behavio
 
 The key design choice is to treat high-energy observations not as a driver-facing annotation event, but as an **offline trigger for controlled expert activation**. A dormant expert is awakened only after sufficient OOD evidence has accumulated. To prevent the newly activated expert from dominating the router under limited new-class evidence, the framework introduces a **smooth routing regularizer** (`L_skew`) that biases the gate distribution gradually rather than through hard expert switching.
 
-Under a unified 3-seed, 5-epoch benchmark on **Split CIFAR-100** and **State Farm Distracted Driver Detection**, EnRoute-CIL provides a strong system-level trade-off between accuracy and forgetting while remaining highly parameter-efficient.
+Under a unified 3-seed, 5-epoch benchmark on **Split CIFAR-100** and **State Farm Distracted Driver Detection**, EnRoute-CIL studies a constrained regime defined by **privacy preservation, replay budget `K=20`, and rapid edge-side adaptation**. The main contribution is not a claim of absolute asymptotic superiority over all prompt methods, but a demonstration that the proposed system design achieves a stronger **accuracy-forgetting trade-off in rapid adaptation scenarios**.
 
 ## Research Positioning
 
@@ -29,7 +29,7 @@ More specifically, the repository studies:
 
 ## Method Overview
 
-EnRoute-CIL combines four core components:
+EnRoute-CIL combines four coupled components:
 
 1. **Frozen ViT backbone**
    - The pre-trained transformer backbone remains fixed.
@@ -46,6 +46,8 @@ EnRoute-CIL combines four core components:
 4. **Energy-guided smooth routing (`L_skew`)**
    - When enough OOD evidence accumulates, routing is gradually biased toward a dormant expert.
    - This is intended to reduce modal overlap and prevent abrupt overfitting to newly observed behavior fragments.
+
+The repository should therefore be read as a **systems paper codebase**: the emphasis is on how these pieces are integrated under edge-side constraints, not on claiming that any single mechanism in isolation is universally novel.
 
 Framework figure:
 
@@ -98,6 +100,19 @@ The top-level aggregate files are:
 - `output/benchmark_sota/benchmark_overview.csv`
 - `output/benchmark_sota/benchmark_overview.json`
 
+### Disclaimer
+
+This benchmark is intentionally conducted under a **strict physical budget**:
+
+- `5 epochs` per task
+- bounded replay memory (`K=20`)
+- frozen backbone updates only
+- privacy-conscious, edge-side adaptation assumptions
+
+Under this regime, traditional prompt-based methods are **not expected to reach their theoretical best performance**. Their slower gradient accumulation and weaker plasticity under short-horizon adaptation can make them appear overly rigid. Accordingly, the benchmark **does not claim that EnRoute-CIL asymptotically surpasses CODA-Prompt or L2P in absolute capacity**. The claim is narrower and more practical:
+
+> **Under rapid adaptation constraints, EnRoute-CIL offers a materially better system-level trade-off between learning speed, accuracy, and forgetting.**
+
 ## Main Results
 
 ### CIFAR-100: Cross-Paradigm Comparison
@@ -137,6 +152,28 @@ Results below use the completed 3-seed benchmark artifacts in `output/benchmark_
 | CODA-Prompt | 15.23% ± 0.66% | **0.08% ± 0.05%** | 18.27% ± 0.79% | 4.29% | **0.6447** |
 | MoE-Adapters4CL | 29.95% ± 10.02% | 3.05% ± 3.89% | 35.88% ± 12.08% | 100.00% | 0.5523 |
 
+## Ablation Study
+
+### Public System Ablation: Full EnRoute-CIL vs Adapter Baseline
+
+The strongest public ablation currently shipped in this repository compares the full EnRoute-CIL system against the frozen-ViT adapter baseline. This is a **system-level ablation**, not a pure single-switch toggle, but it captures the practical effect of adding the routed adaptation stack centered on `L_skew`.
+
+| Configuration | AA (mean ± std) | AF (mean ± std) | Relative AF |
+|---|---:|---:|---:|
+| Frozen ViT + Adapter (`ours_baseline`) | 85.10% ± 1.38% | 14.23% ± 1.73% | 100% |
+| **Full EnRoute-CIL** | **86.02% ± 0.78%** | **10.25% ± 0.70%** | **72.06%** |
+
+This ablation is important precisely because the absolute gain in `AA` is modest (`+0.91` points), while the forgetting reduction is much larger in relative terms (`-27.94%`). That is the engineering signal the repository is built around: **small accuracy gains can hide substantial stability gains**.
+
+Current ablation artifacts are summarized from:
+
+- `output/benchmark_sota/cifar100/ours/multiseed_summary.json`
+- `output/benchmark_sota/cifar100/ours_baseline/multiseed_summary.json`
+
+For a dedicated ablation note, see:
+
+- `ablation_studies/README.md`
+
 ## Result Interpretation
 
 The current benchmark supports three empirical observations.
@@ -152,6 +189,7 @@ The current benchmark supports three empirical observations.
 3. **Energy-guided smooth routing improves the repository's own baseline trade-off.**
    - Relative to the frozen-ViT adapter baseline, EnRoute-CIL gains `+0.91` AA points on CIFAR-100 while reducing forgetting by `27.94%`.
    - This supports the interpretation that `L_skew` helps constrain overfitting pressure during expert activation, rather than simply adding more parameters.
+   - The key sell here is the **architecture trade-off**, not an inflated claim that the routing mechanism alone is the entire contribution.
 
 These are **setting-bounded** observations. They apply to the current protocol, implementation family, and epoch budget; they should not be generalized to all PEFT-CIL settings without further evidence.
 
@@ -266,6 +304,31 @@ For the whole benchmark:
 
 These files are the authoritative source for the result tables reported in this README.
 
+## Analysis Scripts
+
+To support future forensic-style analysis of feature collapse and expert specialization, the repository now includes two generic visualization utilities:
+
+```bash
+python scripts/visualize_feature_tsne.py \
+  --features path/to/features.npy \
+  --labels path/to/labels.npy \
+  --output output/analysis/tsne.png \
+  --title "Feature t-SNE"
+```
+
+```bash
+python scripts/plot_tensor_heatmap.py \
+  --input path/to/weights.npy \
+  --output output/analysis/heatmap.png \
+  --title "Prompt or Router Weights"
+```
+
+These scripts are meant to support:
+
+- t-SNE feature-space inspection across tasks or methods
+- prompt-weight / router-weight heatmaps
+- future visual evidence comparing prompt collapse vs expert specialization
+
 ## Repository Layout
 
 ```text
@@ -290,12 +353,13 @@ EnRoute-CIL/
 └── docs/
 ```
 
-## Limitations
+## Limitations & Future Work
 
 - The current benchmark uses a strict `5-epoch` budget. The resulting trade-offs emphasize rapid adaptation and may differ from longer training schedules.
 - The unified benchmark currently exports `OOD AUROC` for third-party wrappers more consistently than for the native `ours` path. Native OOD behavior is still available in method-specific training artifacts.
-- `State Farm` under `5 + 1 x 5` is intentionally stringent. Results should be interpreted as stress-test behavior under extremely low incremental supervision.
+- `State Farm` remains challenging. Even though EnRoute-CIL achieves the strongest `AA` in the current benchmark, its `AF` is still **30.58% ± 5.86%**, which indicates a remaining representation bottleneck under long incremental sequences and complex driver-pose variation.
 - The repository contains vendored third-party code with compatibility patches required for the unified benchmark harness.
+- A stricter future step is to export intermediate features and gating statistics during benchmark runs, then use the included visualization scripts to show, with direct evidence, how prompt methods and routed-expert methods diverge by the final epoch.
 
 ## License
 
