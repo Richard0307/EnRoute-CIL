@@ -30,7 +30,13 @@ class ArchiveViewDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, index):
-        image = Image.fromarray(self.data[index])
+        sample = self.data[index]
+        if isinstance(sample, np.ndarray):
+            image = Image.fromarray(sample)
+        elif isinstance(sample, (str, np.str_)):
+            image = Image.open(os.fspath(sample)).convert("RGB")
+        else:
+            image = Image.fromarray(np.asarray(sample))
         if self.transform is not None:
             image = self.transform(image)
         return image, self.class_mapping[int(self.targets[index])], -1
