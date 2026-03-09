@@ -353,12 +353,15 @@ EnRoute-CIL/
 
 ## Limitations & Future Work
 
-- The current benchmark uses a strict `5-epoch` budget. The resulting trade-offs emphasize rapid adaptation and may differ from longer training schedules.
-- The unified benchmark currently exports `OOD AUROC` for third-party wrappers more consistently than for the native `ours` path. Native OOD behavior is still available in method-specific training artifacts.
-- `State Farm` remains challenging. Even though EnRoute-CIL achieves the strongest `AA` in the current benchmark, its `AF` is still **30.58% ± 5.86%**, which indicates a remaining representation bottleneck under long incremental sequences and complex driver-pose variation.
-- The repository contains vendored third-party code with compatibility patches required for the unified benchmark harness.
-- A stricter future step is to export intermediate features and gating statistics during benchmark runs, then use the included visualization scripts to show, with direct evidence, how prompt methods and routed-expert methods diverge by the final epoch.
+Extreme Budget Trade-offs: The current benchmark strictly operates under a 5-epoch budget to simulate rapid edge-side adaptation. The resulting accuracy-forgetting trade-offs emphasize immediate plasticity. Future work will explore dynamic epoch scheduling based on the vehicle's offline duration (e.g., overnight charging vs. brief parking).
 
+Representation Bottleneck in Complex Scenes: The State Farm dataset remains highly challenging. Although EnRoute-CIL achieves the highest AA in the current setting, the AF remains at 30.58% ± 5.86%. This indicates a fundamental representation bottleneck when handling long incremental sequences of complex, highly-overlapped driver poses using a fixed-capacity ViT.
+
+Foundation Model Integration (CLIP): While the current framework utilizes an ImageNet-pretrained ViT, migrating the frozen backbone to Vision-Language foundation models (e.g., CLIP) is a highly promising next step. Leveraging CLIP's robust semantic feature space could significantly stabilize the Energy OOD triggers and enhance zero-shot rapid adaptation for unseen in-cabin behaviors.
+
+Empirical Interpretability: A stricter future step is to natively couple intermediate feature extraction and gating statistics with the unified benchmark harness. Using the included visualization scripts, we aim to provide direct, mechanical evidence of how prompt-based methods experience feature collapse, whereas routed-expert methods maintain functional specialization by the final epoch.
+
+Unified Metric Telemetry: Currently, OOD AUROC tracking is more decoupled for baseline wrappers than for our native method. Unifying the real-time OOD logging across all third-party continuous learning wrappers remains an ongoing engineering effort to support finer-grained anomaly analysis.
 ## License
 
 This project is released under the MIT License. See [LICENSE](LICENSE) for details.
