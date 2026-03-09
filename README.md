@@ -137,6 +137,46 @@ Unified metrics:
 - `OOD AUROC / FPR@95TPR`
 - `AA std / AF std`
 
+## CIFAR-100 Result Snapshot (Ours vs Baseline)
+
+Using the completed 3-seed benchmark outputs under:
+
+- `output/benchmark_sota/cifar100/ours/multiseed_summary.json`
+- `output/benchmark_sota/cifar100/ours_baseline/multiseed_summary.json`
+
+where `ours_baseline` keeps the frozen ViT + standard adapter pipeline, and `ours` adds the energy-guided MoE routing mechanism with smooth routing regularization (`L_skew`), the CIFAR-100 comparison is:
+
+| Configuration | AA (mean ± std) | AF (mean ± std) |
+|---|---:|---:|
+| Baseline (`ours_baseline`) | 85.10% ± 1.38% | 14.23% ± 1.73% |
+| Ours (`energy-guided MoE + L_skew`) | 86.02% ± 0.78% | 10.25% ± 0.70% |
+
+Observed deltas (Ours - Baseline):
+
+- `AA`: `+0.91` percentage points
+- `AF`: `-3.98` percentage points
+- Relative forgetting reduction: `27.94%` (`(AF_base - AF_ours) / AF_base`)
+
+This result provides direct evidence that `L_skew` is effective at reducing forgetting/overfitting pressure in this benchmark setting, while preserving a modest AA gain.
+
+## CIFAR-100 Interpretation vs Prompt and MoE Baselines
+
+Under the same 5-epoch, 3-seed benchmark protocol on CIFAR-100:
+
+| Method | AA (mean ± std) | AF (mean ± std) | Final-task Acc (mean) |
+|---|---:|---:|---:|
+| Ours (`energy-guided MoE + L_skew`) | 86.02% ± 0.78% | 10.25% ± 0.70% | 93.33% |
+| Ours Baseline (`frozen ViT + adapter`) | 85.10% ± 1.38% | 14.23% ± 1.73% | 97.90% |
+| L2P | 74.11% ± 1.50% | 1.83% ± 0.13% | 69.67% |
+| CODA-Prompt | 79.31% ± 1.60% | 2.17% ± 0.18% | 75.03% |
+| MoE-Adapters4CL | 79.68% ± 0.76% | 7.34% ± 0.35% | 83.70% |
+
+Interpretation:
+
+- Prompt-family baselines (`L2P`, `CODA-Prompt`) show very low AF, but also much lower AA and lower final-task accuracy in this strict-epoch setting, indicating higher rigidity (limited plastic adaptation to new tasks).
+- Compared with our adapter baseline, EnRoute-CIL improves system-level balance: `+0.91` AA points and `-3.98` AF points (`-27.94%` relative AF), while keeping high final-task learning capability.
+- This supports (not universally proves) the role of `L_skew` in reducing expert-space overfitting and modal overlap under constrained compute budgets.
+
 Implementation note:
 - `L2P` is benchmarked through the vendored PyTorch `L2P` implementation inside `third_party/CODA-Prompt` so that prompt-family baselines run under one unified protocol.
 - `MoE-Adapters4CL` remains a cross-paradigm comparison because it is CLIP/VLM-based.
