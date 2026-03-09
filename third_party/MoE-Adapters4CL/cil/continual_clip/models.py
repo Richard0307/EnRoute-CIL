@@ -116,15 +116,11 @@ class ClassIncremental(nn.Module):
                 train_iter = iter(train_loader)
                 inputs, targets, task_ids = next(train_iter)
 
-            if cfg.dataset == "tinyimagenet" and task_id != 0:
-                shift = 100 + (task_id - 1) * cfg.increment
-                targets -= shift
-            elif cfg.dataset == "imagenet100" and task_id != 0:
-                shift = cfg.initial_increment + (task_id - 1) * cfg.increment
-                targets -= shift
+            if task_id == 0:
+                shift = 0
             else:
-                shift = task_id * cfg.increment
-                targets -= shift
+                shift = cfg.initial_increment + (task_id - 1) * cfg.increment
+            targets -= shift
 
             inputs, targets = inputs.cuda(), targets.cuda()
 
