@@ -24,7 +24,7 @@ Derived deltas:
 - `AF`: `-3.98` percentage points
 - Relative AF reduction: `27.94%`
 
-## Why This Ablation Matters
+## Analysis
 
 The numerical pattern is the important part:
 
