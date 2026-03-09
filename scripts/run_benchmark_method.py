@@ -276,7 +276,7 @@ def _run_coda_family(args: argparse.Namespace, assets: dict[str, Path], learner_
 
 
 def _write_moe_config(path: Path, dataset: str, epochs: int, batch_size: int,
-                      output_dir: Path, seed: int, workers: int) -> None:
+                      output_dir: Path, seed: int, workers: int, repo_dir: Path) -> None:
     if dataset == "cifar100":
         initial_increment = 50
         increment = 10
@@ -300,7 +300,7 @@ def _write_moe_config(path: Path, dataset: str, epochs: int, batch_size: int,
 
 class_order: ""
 dataset_root: "{dataset_root}"
-workdir: ""
+workdir: "{repo_dir}"
 log_path: "metrics.json"
 model_name: "ViT-B/16"
 prompt_template: "a bad photo of a {{}}."
@@ -382,6 +382,7 @@ def _run_moe(args: argparse.Namespace, assets: dict[str, Path]) -> dict[str, Any
         args.output_dir,
         args.seed,
         args.num_workers,
+        repo_dir.resolve(),
     )
     cmd = [
         sys.executable,

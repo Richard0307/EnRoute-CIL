@@ -70,13 +70,21 @@ def collect_energy_scores(model, dataloader):
 @hydra.main(config_path=None, config_name=None, version_base="1.1") 
 def continual_clip(cfg: DictConfig) -> None:
 
-    cfg.workdir = utils.get_workdir(path=os.getcwd())
-    cfg.dataset_root = os.path.join(cfg.workdir, cfg.dataset_root)
+    if getattr(cfg, "workdir", ""):
+        cfg.workdir = os.path.abspath(os.path.expanduser(cfg.workdir))
+    else:
+        cfg.workdir = utils.get_workdir(path=os.getcwd())
+
+    if not os.path.isabs(cfg.dataset_root):
+        cfg.dataset_root = os.path.join(cfg.workdir, cfg.dataset_root)
 
     utils.save_config(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     utils.seed_all(int(getattr(cfg, "seed", 42)))
-    cfg.class_order = utils.get_class_order(os.path.join(cfg.workdir, cfg.class_order))
+    class_order_path = cfg.class_order
+    if not os.path.isabs(class_order_path):
+        class_order_path = os.path.join(cfg.workdir, class_order_path)
+    cfg.class_order = utils.get_class_order(class_order_path)
     model  = load_model(cfg, device)
     model_stats = {
         "total_params": int(sum(p.numel() for p in model.parameters())),
