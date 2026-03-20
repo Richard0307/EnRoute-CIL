@@ -183,7 +183,7 @@ def plot_max_memory_allocated(runtime_metrics: dict[str, np.ndarray], output_dir
     plt.close(fig)
     return path
 
-
+# funciton for draw old acc
 def plot_old_task_accuracy(runtime_metrics: dict[str, np.ndarray], output_dir: Path) -> Path:
     """Plot mean accuracy on old tasks after each incremental stage."""
     task_ids = runtime_metrics["task_ids"]
