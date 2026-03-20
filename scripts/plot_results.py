@@ -23,7 +23,7 @@ matplotlib.rcParams.update({
     "savefig.pad_inches": 0.1,
 })
 
-
+# draw task acc
 def plot_task_accuracy_over_time(acc_matrix: np.ndarray, output_dir: Path) -> Path:
     """Plot each task's accuracy as training progresses through tasks."""
     T = acc_matrix.shape[0]
