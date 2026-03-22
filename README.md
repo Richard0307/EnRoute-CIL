@@ -49,7 +49,7 @@ EnRoute-CIL combines four coupled components:
 
 Framework figure:
 
-![Framework](docs/rp_framework_paper.png)
+![Framework](docs/architecture_v4.png)
 
 ## Benchmark Protocol
 
