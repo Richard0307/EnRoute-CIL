@@ -241,14 +241,14 @@ EnRoute-CIL/
 
 ## Citation
 
-```bibtex
+<!-- ```bibtex
 @article{hu2025enroutecil,
   title={EnRoute-CIL: Energy-Guided Routed Continual Learning for Intelligent Cockpit},
   author={Hu, Qingquan},
   journal={arXiv preprint arXiv:XXXX.XXXXX},
   year={2025}
 }
-```
+``` -->
 
 ## License
 
